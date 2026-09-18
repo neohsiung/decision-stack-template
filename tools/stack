@@ -1311,7 +1311,8 @@ def cmd_shape(args):
         print(f"\n  （對照：凝聚度最高的是 {rows[-1][3]['stem']} {rows[-1][0]:.3f}——單一主張長這樣）")
 
 
-# 可升級區：會被複製給別人的東西。這裡的每一句都要換一台機器、換一個人仍成立。
+# 受去個人化檢查的散文。這裡的每一句都要換一台機器、換一個人仍成立。
+# 實際受檢的範圍是這一組與 UPGRADABLE_GLOBS 的聯集，見 shippable_files()。
 SHIPPABLE_GLOBS = ["README.md", "README.en.md", "SPEC.md", "WRITING.md", "examples/*.md", "tools/stack", "tools/outward-write-guard", "tools/hooks/*",
                    "tools/context/*.md", "tools/context/MANIFEST.tsv", "skills/*/*.md",
                    "tools/local.example/*", "tools/stack.config.toml.example",
@@ -1331,13 +1332,25 @@ SHIP_WARN = [(r"目前", "目前"), (r"自己", "自己")]
 
 
 def shippable_files():
+    """受去個人化檢查的檔案＝這一組 glob 加上可升級區的全部。
+
+    **會被發布的一定要受檢，這是不變量。** 分成兩組 glob 是因為它們回答不同的問題：
+    這一組問「哪些散文要受檢」，UPGRADABLE_GLOBS 問「哪些檔案的擁有者是 template」。
+    問題不同，但答案不能讓前者小於後者。
+
+    取聯集而不是各自維護，理由是實測：發布第一版時可升級區有 41 檔，而這一組只涵蓋
+    35 檔。ci.yml、兩個 .gitignore、VERSION 與兩個 testdata 檔會被複製給別人，卻從來
+    沒有被檢查過。那一次靠人逐檔讀完才敢推，而人讀不是可重複的保障。
+
+    聯集之後，往可升級區加一個 glob 就自動進入檢查範圍，兩份清單不會再分歧。
+    """
     import glob
-    out = []
-    for g in SHIPPABLE_GLOBS:
-        for path in sorted(glob.glob(os.path.join(ROOT, g))):
+    out = set()
+    for g in list(SHIPPABLE_GLOBS) + list(UPGRADABLE_GLOBS):
+        for path in glob.glob(os.path.join(ROOT, g)):
             if os.path.isfile(path):
-                out.append(os.path.relpath(path, ROOT))
-    return out
+                out.add(os.path.relpath(path, ROOT))
+    return sorted(out)
 
 
 def read_denylist():
@@ -1893,7 +1906,8 @@ def cmd_init(args):
 
 # 可升級區：template 擁有的路徑。upgrade 只覆蓋這些，contribute 只接受這些。
 # 與 SHIPPABLE_GLOBS 分開：那一組管「哪些散文要受去個人化檢查」，這一組管
-# 「哪些檔案的擁有者是 template」。兩者重疊但不相等，合併會讓其中一邊被另一邊拖著改。
+# 「哪些檔案的擁有者是 template」。兩個問題不同，所以兩份清單留著。
+# 但受檢範圍取兩者的聯集：會被發布的一定要受檢，這一邊只能大於等於那一邊。
 UPGRADABLE_GLOBS = [
     "README.md", "README.en.md", "SPEC.md", "WRITING.md", "examples/*.md", "LICENSE", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", ".gitignore",
     "tools/stack", "tools/outward-write-guard", "tools/VERSION", "tools/.gitignore",
