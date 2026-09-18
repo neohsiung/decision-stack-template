@@ -2040,6 +2040,19 @@ def cmd_contribute(args):
         return 1
     print("✓ 去個人化過了。換一台機器、換一個人，這幾個檔裡的句子都還成立。")
 
+    # 內容變了而版本沒變，會讓 cmd_upgrade 的分支名重複：branch = upgrade/<template 版本>。
+    # 第二次執行的人撞到「分支已存在」，而開頭那行還會印「本機 X　template X」卻列出
+    # 異動檔。兩者都不是靜默失敗，但都是可以避免的摩擦。
+    #
+    # 這裡只提醒不擋。送給別人的 template 時，版本由對方決定，不由貢獻者決定。
+    # 工具分不出這兩種身分，所以把兩種情況都講出來，讓看的人對號。
+    version_rel = os.path.relpath(VERSION_PATH, ROOT)
+    if version_rel not in args.paths and any(p != version_rel for p in args.paths):
+        print(f"\n△ 清單裡沒有 {version_rel}，現在是 {local_version()}。")
+        print("    你是這個 template 的維護者：內容變了版本要跟著動，"
+              "cmd_upgrade 拿版本號當分支名。")
+        print("    你在送改動給別人的 template：版本由對方決定，這一句忽略。")
+
     topic = args.topic or "contrib"
     print("\n下一步自己跑。這支工具不替你推送到別人的 repo：")
     print(f"  git checkout -b contrib/{topic}")
