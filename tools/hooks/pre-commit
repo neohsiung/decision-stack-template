@@ -1,0 +1,43 @@
+#!/bin/sh
+# 決策棧 pre-commit 閘門（進版控，跨裝置跟著 repo 走）。
+# 安裝（換機器第 3 步）：git config core.hooksPath tools/hooks
+# 擋三種失效：
+#   1) 身分外流：非本 repo 宣告身分的 commit（例如另一個組織的信箱，來自 cwd 在別處的 session）
+#   2) 格式違規：不合 WRITING §frontmatter／§寫作指南 的條目（stack lint 紅燈）
+#   3) 可升級區夾帶只對本機或本人成立的文字（stack lint --shippable 紅燈）
+
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+# --- 1) 身分閘門：author/committer 必須等於 repo local user.email ---
+repo_email=$(git config --local user.email || true)
+if [ -z "$repo_email" ]; then
+  echo "✗ pre-commit：本 repo 未設 local user.email，先跑：git config user.email <個人信箱>" >&2
+  exit 1
+fi
+author_email="${GIT_AUTHOR_EMAIL:-$(git config user.email)}"
+committer_email="${GIT_COMMITTER_EMAIL:-$(git config user.email)}"
+for e in "$author_email" "$committer_email"; do
+  if [ "$e" != "$repo_email" ]; then
+    echo "✗ pre-commit：commit 身分 $e ≠ 本 repo 宣告身分 $repo_email。" >&2
+    echo "  個人棧不得用其他身分（含組織信箱）commit——通常是 session 從別的 cwd 帶進了 env 覆寫。" >&2
+    echo "  修法：unset GIT_AUTHOR_EMAIL GIT_COMMITTER_EMAIL 後重 commit。" >&2
+    exit 1
+  fi
+done
+
+# --- 2) 格式閘門：stack lint 紅燈就擋 ---
+if ! tools/stack lint >/tmp/stack-lint-precommit.log 2>&1; then
+  echo "✗ pre-commit：stack lint 未過，摘要：" >&2
+  grep -E '✗' /tmp/stack-lint-precommit.log | head -10 >&2
+  echo "  完整輸出：/tmp/stack-lint-precommit.log" >&2
+  exit 1
+fi
+# --- 3) 可升級區閘門：換一台機器、換一個人，這句話還成立嗎 ---
+if ! tools/stack lint --shippable >/tmp/stack-shippable-precommit.log 2>&1; then
+  echo "✗ pre-commit：可升級區有只對本機或本人成立的文字：" >&2
+  grep -E 'L[0-9]+ \[' /tmp/stack-shippable-precommit.log | head -10 >&2
+  echo "  完整輸出：/tmp/stack-shippable-precommit.log。判準見 SPEC §去識別化判準 第二組。" >&2
+  exit 1
+fi
+exit 0

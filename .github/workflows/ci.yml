@@ -1,0 +1,25 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 三項都不需要網路與嵌入模型：純檔案與 git 檢查
+      - name: lint
+        run: tools/stack lint
+
+      - name: shippable
+        run: tools/stack lint --shippable
+
+      - name: doctor self-test
+        run: tools/stack doctor --self-test

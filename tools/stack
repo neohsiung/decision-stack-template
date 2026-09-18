@@ -1,0 +1,2699 @@
+#!/usr/bin/env python3
+"""stack — 個人決策棧的檢索承載層。
+
+它存在的理由只有一個：**讓覆蓋率的保證從「模型的注意力」換成「程式的迴圈」。**
+
+以前要確定一個新想法有沒有跟既有原則重複、該掛在哪一層，唯一的辦法是把整個 repo 讀進
+context（成本見 SPEC §檢索），而且那個保證是靠自律維持的——跳過一次跟做到一次長得
+一模一樣。這支工具掃 100% 的條目，只把相關的那幾筆吐出來。
+
+`recall` 會把尚未合進 `origin/main` 的條目標成〔未審〕。理由見
+Decisions/gate-the-effect-boundary-not-the-exit.md：檢索讀的是工作目錄，所以一條原則寫下的
+當秒就已經在影響判斷，而 push 閘門守不到那條線。擋不住就標記，最糟的是既沒擋也沒標。
+
+指令彼此不重疊（同一條 SRP 判準也適用於工具本身）：
+
+    stack recall "<一段話>"   語意檢索 top-k ＋ 一跳連結鄰居 —— 寫入前的 dedupe、回答前的檢索
+                              （--stale-ok：唯讀用舊索引，計畫模式或趕時間用）
+    stack tree                依 upstream 印格狀結構 —— 瀏覽視角；查找走 recall
+    stack shape               全量 cluster —— 該收斂的群、凝聚度最低的拆分候選
+    stack lint                純機械檢查 —— 索引↔檔案、連結、frontmatter、upstream、詞彙表、索引過期
+    stack usage               使用記錄報表 —— 淘汰候選的下界指標
+    stack eval                召回率回歸 —— 唯一能證明改動沒有讓檢索悄悄變差的東西
+
+## 為什麼一筆條目要拆成多個向量
+
+這個 repo 的內容依 §去識別化判準 一律是抽象語句，而真實查詢永遠是具體語彙（「筆電體積」
+「記憶體漲價」）。稠密檢索跨不過抽象↔具體那一段——實測把整份條目串成一個向量時，一條專門
+在講「影響邊界怎麼展開」的模型，對一個標準的影響範圍問題只排到第 23 名。
+
+原因是**串接會稀釋**：757 字的抽象論述把裡面唯一那句具體例子淹掉了。所以改成一筆條目切成
+多個視角各自嵌入、查詢時取最大值（max-pool）——例子那一段可以自己被命中，不必先擠過整篇的
+平均語意。同一組回歸題從 top-3 命中 5/8、平均 rank 4.6，變成 7/8、平均 rank 2.0。
+
+兩種視角刻意分開用途：
+
+  - **claim 視角**（description ＋ 第一句粗體規則）＝ 這筆在主張什麼
+  - **body 視角**（正文各段落）＝ 這筆長什麼樣、舉了什麼例子
+
+`recall` 取所有視角的最大值（要的是「找得到」）；`shape` 只比 claim 視角（要的是「兩筆是不是
+在講同一件事」——例子像不構成該合併）。
+
+max-pool 有一個已知偏誤：**視角越多＝抽獎券越多**，段落多的長條目會靠某一段泛泛而談的話在
+不相關的查詢裡拿到高分。試過六種修法（只用 claim、body 打折 α=0.3/0.5/0.7、視角數懲罰、
+加權平均），13 題回歸的差距全在雜訊內——**所以不調參數**。真正的原因是那些長條目同時服務太多
+檢索情境，也就是 SRP 違反；該修的是條目而不是排序公式。`stack eval` 因此會直接把「檢索吸子」
+列出來當拆分候選。多一個魔術常數換不到品質，只換到一個沒人記得為什麼是 0.5 的參數。
+
+「相關：」那一段不進視角。它描述的是別的條目，留著會讓 A 因為引用了 B 的主張而在查 B 時被
+撈出來；那條關係已經由一跳連結鄰居覆蓋了。
+
+## 設計上刻意不做的事
+
+  - **不引入任何 pip 依賴。** 51–200 筆的暴力點積是毫秒級，向量資料庫在這個規模是拿依賴換
+    不存在的效能。
+  - **不送任何內容到外部服務。** embedding 走本機 Ollama。private repo 也要當成可能被看到，
+    送外部 API 做 embedding 等於自己開一個外流面。
+  - **不改內容。** 它只產候選與報告；拆分、合併、改寫全部人工定案。
+  - **不做 LLM 生成的假想提問。** 那條路（為每筆條目生成它會回答的具體問題）實測更好，但那次
+    的提問是看過測試題之後寫的，數字不算數。要用它得先有一組沒看過查詢就寫好的提問。
+
+索引過期是這支工具自己會踩的坑，而且正是 Decisions/source-migration-downstream-drift.md
+描述的那一種：索引還在、還查得出東西，只是不再反映新條目，**失效完全靜默**。所以每次
+recall/shape 都先比對內容雜湊，變了的當場重嵌，不依賴人記得去跑 `stack index`。
+"""
+
+import argparse
+import array
+import base64
+import datetime
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+# realpath，不是 abspath。這支腳本會被 symlink 到 PATH 上，abspath 不解 symlink，
+# ROOT 會落在 shim 所在的目錄，整個 repo 找不到。
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LAYERS = {"Models": "model", "Decisions": "decision", "Frameworks": "framework"}
+# Expressions 是目錄，不是第四層。三層構成推導鏈：信念→骨架→判斷。Expressions 裝的是那條鏈
+# 末端產物的形狀規格，不是鏈上的第四環。所以它的檢索鍵是下面三軸，不是 upstream，也不進
+# tree 的格狀結構與孤兒報告。同一個前例見 write-procedure.md §step 3 的「Pending/ 不是第四層」。
+EXPRESSIONS = "Expressions"
+# 掃描範圍＝三層加 Expressions。分層邏輯（rank、tree、孤兒覆蓋率）一律只走 LAYERS。
+SCAN_DIRS = {**LAYERS, EXPRESSIONS: "expression"}
+# 兩個維度，三個鍵。對象由方向與權責兩件事決定，所以機械上拆兩個鍵。
+#
+# 渠道記的是讀者以什麼方式接觸到這份東西，不是它用哪套軟體送出去的。所以報告、提案、
+# 會議記錄都落在「溝通文件」，而簡報另立一值：讀者不能自己控制節奏。
+#
+# 權責借 RACI 的詞當名字是因為那組詞最好懂，收的卻不是完整的權責角色，是收件人對這件事的
+# 四種立場。要指派權責時走 Frameworks/responsibility-assignment.md，那副骨架明說 RACI 不是
+# 唯一選項。角色是情境的函數，所以這裡記的是這一格裡對方的位置，不是那個人的標籤。
+#
+# 意圖不設鍵。它記的是「我要對方做什麼」，與權責的「對方是誰」是同一件事的兩端，而同一格
+# 裡的意圖可變，設成鍵會讓一格裂成多筆而那幾筆的規格其實共用。意圖留在四軸骨架裡。
+EXPRESSION_AXES = {
+    "audience_direction": ["對上", "水平", "對下"],
+    "audience_role": ["決定者", "執行者", "被諮詢者", "被知會者"],
+    "channel": ["即時訊息", "電子郵件", "票卡留言", "溝通文件", "簡報"],
+}
+# 每層固定分節（WRITING §寫作指南·正文結構）。順序固定。lint 查存在與順序。
+SECTIONS = {
+    "Models": ["信念", "適用界線", "不適用的情況"],
+    "Frameworks": ["用在什麼時候", "步驟或檢查面", "停止條件"],
+    "Decisions": ["規則", "事件", "為什麼", "怎麼用"],
+    EXPRESSIONS: ["適用的格子", "規格", "骨架", "不用它的情況"],
+}
+# 首句規則句不得含的接續記號：一句只講一個意思
+RULE_FORBIDDEN = ("——", "；", "：")
+# 密度警訊門檻。超過只提醒，不擋。
+# 數字從校準組量出來，不是訂出來的。作者親手改寫的三筆，句中破折號最高 2.03/千，
+# 全棧中位數 4.1/千。門檻取 2.5：校準組三筆全部通過，而全棧仍有 86% 在門檻之上。
+# 校準組的檔案被自己的門檻擋掉，那門檻就是錯的。
+# 引號密度刻意不設門檻：校準組裡改得最乾淨的那一筆引號密度最高，它不是品質訊號。
+DENSITY_MID_DASH_PER_K = 2.5
+DENSITY_AVG_SENTENCE = 55
+INDEX_PATH = os.path.join(ROOT, "tools", ".index.json")
+BRANCH_INDEX_PATH = os.path.join(ROOT, "tools", ".index-branches.json")
+MEMORY_PATH = os.path.join(ROOT, "MEMORY.md")
+
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+EMBED_MODEL = os.environ.get("STACK_EMBED_MODEL", "bge-m3")
+# 純 CPU 跑 bge-m3 實測約 20–25 秒/視角，一批 24 個視角就會超過 300 秒——逾時要蓋得住
+# 最慢的機器，否則「機器慢」會被誤讀成「服務掛了」。
+EMBED_TIMEOUT = int(os.environ.get("STACK_EMBED_TIMEOUT", "900"))
+
+REQUIRED_FIELDS = ("name", "description", "type", "origin", "recorded")
+MIN_VIEW_CHARS = 20
+MAX_VIEW_CHARS = 1200
+
+
+# ---------------------------------------------------------------- 讀取與解析
+
+def parse_frontmatter(text):
+    """回傳 (frontmatter dict, body)。續行（不是 `key:` 開頭的行）併進前一個鍵。"""
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+    fm, key = {}, None
+    for line in text[4:end].split("\n"):
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if m:
+            key = m.group(1)
+            fm[key] = m.group(2).strip()
+        elif key and line.strip():
+            # related 一筆一行，要保留行界；其他欄位是單行值的續行
+            sep = "\n" if key == "related" else " "
+            fm[key] = (fm[key] + sep + line.strip()) if fm[key] else line.strip()
+    return fm, text[end + 5:]
+
+
+def first_rule(body):
+    """正文第一句粗體規則句。repo 慣例保證那就是可遷移的規則。"""
+    m = re.search(r"\*\*(.+?)\*\*", body, re.S)
+    return re.sub(r"\s+", "", m.group(1)) if m else ""
+
+
+def entry_links(relpath, body):
+    """條目間的相對連結，正規化成 repo 相對路徑。"""
+    out, base = [], os.path.dirname(relpath)
+    for target in re.findall(r"\]\(([^)]+?\.md)\)", body):
+        if target.startswith("http"):
+            continue
+        norm = os.path.normpath(os.path.join(base, target))
+        if norm not in out:
+            out.append(norm)
+    return out
+
+
+def strip_related(body):
+    """砍掉「相關：」以後的內容——那段講的是別的條目，不是這一筆的主張。"""
+    m = re.search(r"\n\s*(?:相關|延伸|參見)[：:]", body)
+    return body[:m.start()] if m else body
+
+
+def strip_section(body, heading):
+    """砍掉某個 `## 標題` 到下一個 `## ` 之間的內容，含標題本身。"""
+    m = re.search(rf"^##\s+{re.escape(heading)}\s*$", body, re.M)
+    if not m:
+        return body
+    nxt = re.search(r"^##\s+", body[m.end():], re.M)
+    return body[:m.start()] + (body[m.end() + nxt.start():] if nxt else "")
+
+
+def build_views(fm, body, layer=None):
+    """回傳 [(kind, text)]。kind 只有 claim 與 body 兩種，用途不同。
+
+    Expressions 只出 claim 視角，不出 body。理由是量出來的：正文裡「寫給誰、寫多長、
+    什麼結構」這類句子到處都是，body 視角會在泛用的原則查詢上贏過真正回答那個問題的
+    條目。第一次把兩筆 Expression 放進索引，eval 的 recipient-delta 就從 rank 4 掉到 6。
+
+    軸不合成視角。試過把「寫給對上的決定者，走簡報」這種句子放進 claim，結果權責那幾個詞
+    撞上責任歸屬的查詢，eval 的 listed-is-not-owner 掉出 top-3。而拿掉合成句之後，兩筆
+    Expression 在自己的動作查詢上照樣是第一名。**軸是組織鍵不是檢索鍵**：它管 lint、管索引
+    分組、管矩陣看得出哪一格沒填。檢索靠 description，所以 description 要寫出這一格的情境，
+    templates/expression.md 有這一條。
+    """
+    views = []
+    desc = fm.get("description", "").strip()
+    if desc:
+        views.append(("claim", desc))
+    rule = first_rule(body)
+    if rule:
+        views.append(("claim", rule))
+    if layer == EXPRESSIONS:
+        return views
+    for para in re.split(r"\n\s*\n", strip_related(body)):
+        text = re.sub(r"\s+", "", re.sub(r"[*`#>]|^\s*[-–]\s*", "", para, flags=re.M))
+        if len(text) >= MIN_VIEW_CHARS:
+            views.append(("body", text[:MAX_VIEW_CHARS]))
+    return views
+
+
+def parse_related(fm):
+    """frontmatter `related:` → [(目標, 分界句)]。一筆一行，格式 `<檔名> — <分界句>`。
+
+    目標可以是 repo 相對路徑、檔名或 stem；lint 用 resolve_entry_ref 解。
+    """
+    raw = fm.get("related", "").strip()
+    if not raw:
+        return []
+    out = []
+    for line in raw.split("\n"):
+        line = line.strip().lstrip("-").strip()
+        if not line:
+            continue
+        target, _, note = line.partition(" — ")
+        out.append((target.strip(), note.strip()))
+    return out
+
+
+def resolve_entry_ref(ref, live):
+    """把 related 的目標寫法解成 repo 相對路徑；解不到回 None。"""
+    ref = ref.strip()
+    if ref in live:
+        return ref
+    stem = ref[:-3] if ref.endswith(".md") else ref
+    stem = stem.split("/")[-1]
+    hits = [p for p in live if p.endswith("/" + stem + ".md")]
+    return hits[0] if len(hits) == 1 else None
+
+
+def entry_sections(body):
+    """正文的 `## ` 標題依序回傳。"""
+    return [m.strip() for m in re.findall(r"^##\s+(.+?)\s*$", body, re.M)]
+
+
+def prose_body(body):
+    """把一段文字正規化成可以量句子的形狀：去程式碼區塊、表格列、frontmatter。
+
+    density() 與 cmd_prose 共用這一份，兩邊的數字才比得起來。
+    """
+    text = re.sub(r"```.*?```", "", body, flags=re.S)
+    text = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("|"))
+    return re.sub(r"^---.*?---\s*", "", text, flags=re.S)
+
+
+def prose_sentences(text):
+    """切成句子。標題、條列項、表格列各自是一個單位，段落內的硬斷行接回去。
+
+    **這跟 density() 的切法不同，而且是故意的。** density() 先把所有空白拿掉再切句號，
+    那對條目成立，因為條目是以句號結尾的散文。留言與訊息大量是條列與標題，不以句號結尾，
+    用那個切法整段會被算成一句，量出來的句均會是假的。lint 的密度門檻是照 density()
+    校準出來的，所以那一支不動；要量 repo 之外的文字走這一支。
+    """
+    units, para = [], []
+    for line in text.splitlines():
+        t = line.strip()
+        if not t:
+            if para:
+                units.append("".join(para)); para = []
+            continue
+        if re.match(r"^(#{1,6}\s|[-*+]\s|\d+[.)]\s|>|\|)", t):
+            if para:
+                units.append("".join(para)); para = []
+            units.append(re.sub(r"^(#{1,6}\s*|[-*+]\s*|\d+[.)]\s*|>\s*|\|)", "", t))
+        else:
+            para.append(t)
+    if para:
+        units.append("".join(para))
+    out = []
+    for u in units:
+        # 中文句號直接切。英文的句點只在「前面是字母、後面是空白或結尾」時才算句末，
+        # 這樣 0.39 與 file.md 不會被切開。切之前先切英文，因為去空白之後就判斷不了。
+        u = re.sub(r"(?<=[A-Za-z])[.!?](?=\s|$)", "。", u)
+        out += [x for x in re.split(r"[。！？]", re.sub(r"\s+", "", u)) if len(x) > 3]
+    return out
+
+
+def prose_stats(body):
+    """(句數, 句均字數, 超過 40 字的比例, 句中破折號/千字)。沒有句子時全部回 0。"""
+    text = prose_body(body)
+    chars = len(re.sub(r"\s+", "", text))
+    sents = prose_sentences(text)
+    if not sents or chars == 0:
+        return 0, 0.0, 0.0, 0.0
+    n = 0
+    for line in text.splitlines():
+        n += re.sub(r"^\s*[-*]\s*\*\*[^*]+\*\*——", "", line.strip()).count("——")
+    lens = [len(x) for x in sents]
+    return (len(sents), sum(lens) / len(lens),
+            sum(1 for x in lens if x > 40) / len(lens) * 100, n / (chars / 1000))
+
+
+def density(body):
+    """(句中破折號/千字, 句均字數)。排除程式碼區塊與表格列。
+
+    只算**句中**破折號。條列項的標籤分隔（`- **某項**——說明`）不算：那是版面，
+    校準組保留了它。要刪的是拿破折號當連接詞接第二個意思的用法。
+    """
+    text = prose_body(body)
+    chars = len(re.sub(r"\s+", "", text))
+    if chars == 0:
+        return 0.0, 0.0
+    n = 0
+    for line in text.splitlines():
+        n += re.sub(r"^\s*[-*]\s*\*\*[^*]+\*\*——", "", line.strip()).count("——")
+    sents = [x for x in re.split(r"[。！？]", re.sub(r"\s+", "", text)) if len(x) > 3]
+    avg = (sum(map(len, sents)) / len(sents)) if sents else 0.0
+    return n / (chars / 1000), avg
+
+
+# 可機械檢查的 AI 語標記。WRITING §句子 列了五樣，這裡只收正規表示式抓得準的兩樣。
+#
+# 對仗式收尾與名詞化主語不收。兩者都要判斷句子的語意角色，正規表示式做不到，硬做會製造
+# 大量誤判，而誤判會讓整組提醒一起被忽略。它們留在 README 的散文規則裡靠人讀，**是刻意
+# 不做，不是漏掉**。
+#
+# 粗體宣告密度也還沒收：門檻要從校準組量出來，而校準組裡沒有 Expression。等第二批寫完再量。
+# 「不是X是Y」這一條是**提示不是判決**。這個句型有兩種用法，正規表示式分不出來：
+# 對比本身就是主張時要留（「上游層的時間不是成本，是保險」「說不出基準的決策不是判斷，
+# 是意見」），這個 repo 的檔名就是這個形式，WRITING §命名 明寫那是索引設計。對比只是修辭時
+# 才刪（「寫不下不是加長的理由，是判斷還沒收斂」，正面講一次就夠）。
+# 實測：某次盤點 Models 撈到八處，七處是主張本身，只有一處是裝飾。所以看到數字不要直接去清。
+AI_TELLS = [
+    (re.compile(r"不是[^。；\n]{1,24}(?:[，、]\s*是|而是)"), "不是X是Y"),
+    # 只收「前者」「後者」。WRITING §對照其他條目 禁的是四個詞，另外兩個收不乾淨：
+    #   「基本條件」裡面包著「本條」，要求前面不接中文字才排除得掉；
+    #   但「那條規則指名的關卡」與「那條已經從本檔拆出去」都在句首，前者是名詞短語、
+    #   後者是回指，差別在後面接名詞還是動詞。那是詞性判斷，正規表示式做不到。
+    # 硬收的話偽陽性會多到讓整組提醒被忽略。「本條」「那條」交給人讀，而 related: 欄位
+    # 那一側本來就由格式檢查擋著。
+    (re.compile(r"前者|後者"), "回指詞"),
+    # 自造比喻。WRITING §句子 列的詞裡只收這兩個，其餘量過之後確定是偽陽性機器：
+    #   「漏」60 次全是中文常用義（漏了驗證階段、必漏上限），「形狀」65 次已經是全庫
+    #   採用的術語，跟「閘門」「骨架」同類。把它們列進來會擋掉正確的寫法。
+    # 這兩個不一樣：替代詞明確（不產生訊號、檢查失敗），而且量出來只有 15 處。
+    (re.compile(r"靜默|亮紅燈"), "自造比喻"),
+]
+
+# 刻意不做成檢查的，連同理由記在這裡，免得下一輪有人以為是漏掉的：
+#   對仗式收尾、標語式宣告、情緒鋪陳、一句一意、why/what/how 分類、抽象名詞當主語、
+#   還沒驗證要寫成還沒驗證 —— 全部要判斷語意角色，正規表示式做不到。
+#   括號補充 —— 量過一批真實留言，63 處幾乎全是識別碼與引用。
+#   被X者造詞式角色名 —— 只有 6 處真陽性，而且會誤傷受控詞彙「被知會者」。
+#   空節偵測 —— 現況 0 個空節，沒有要防的東西。
+#   recorded 不回填、拆檔沿用母條目 —— 沒有可比對的事實。
+
+
+def ai_tells(body):
+    """回傳 [(標記名, 次數)]。排除程式碼區塊與 frontmatter。"""
+    text = re.sub(r"```.*?```", "", body, flags=re.S)
+    text = re.sub(r"^---.*?---\s*", "", text, flags=re.S)
+    out = []
+    for pat, name in AI_TELLS:
+        n = len(pat.findall(text))
+        if n:
+            out.append((name, n))
+    return out
+
+
+def parse_upstream(fm):
+    """frontmatter `upstream:` → repo 相對路徑清單（逗號分隔、可多筆＝多對多）。"""
+    raw = fm.get("upstream", "").strip()
+    if not raw:
+        return []
+    return [os.path.normpath(p.strip()) for p in raw.split(",") if p.strip()]
+
+
+def assert_repo_root():
+    """ROOT 必須真的是一個決策棧 repo，否則明確失敗。
+
+    沒有這道檢查，ROOT 算錯的結果是 recall 印出「決策棧檢索：命中」後面空白、exit 0。
+    看起來像這次沒有相關條目，實際是沒找到 repo。兩件事要做的處置完全不同。
+    """
+    missing = [d for d in LAYERS if not os.path.isdir(os.path.join(ROOT, d))]
+    if len(missing) != len(LAYERS):
+        return
+    # 剛從 template clone 下來的樣子：工具在、模板在、條目目錄還沒建。這種情況
+    # 答案是「還沒跑 init」，不是路徑推導壞掉。兩者的處置完全不同，訊息要分開。
+    if os.path.isdir(os.path.join(ROOT, "templates")) and \
+       os.path.isfile(os.path.join(ROOT, "tools", "VERSION")):
+        die(f"{ROOT} 看起來是剛 clone 下來、還沒初始化的模板。"
+            f"\n  先跑：{os.path.relpath(os.path.realpath(__file__), ROOT)} init"
+            f"\n  它會建 {'／'.join(LAYERS)}、Expressions/、Pending/ 與 MEMORY.md。")
+    die(f"{ROOT} 不是決策棧 repo，找不到 {'／'.join(LAYERS)} 任何一個。"
+        f"\n  這支腳本從自身位置推導 repo root。經 symlink 呼叫而推導失敗會落在這裡。"
+        f"\n  → 確認 {os.path.realpath(__file__)} 落在 repo 的 tools/ 底下"
+        f"\n  → 接線壞掉時重跑：<repo>/tools/stack install --yes")
+
+
+def load_entries():
+    entries = []
+    for layer in SCAN_DIRS:
+        d = os.path.join(ROOT, layer)
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".md"):
+                continue
+            relpath = f"{layer}/{fn}"
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                text = f.read()
+            fm, body = parse_frontmatter(text)
+            views = build_views(fm, body, layer)
+            upstream = parse_upstream(fm)
+            links = entry_links(relpath, body)
+            related = parse_related(fm)
+            entries.append({
+                "relpath": relpath,
+                "layer": layer,
+                "stem": fn[:-3],
+                "fm": fm,
+                "body": body,
+                "upstream": upstream,
+                "related": related,
+                # upstream 也餵進 links：recall 的一跳鄰居沿它展開，族譜關係就是檢索路徑。
+                # related 的目標在 load 後解析（要先知道全部路徑），見下方補接。
+                "links": links + [u for u in upstream if u not in links],
+                "views": views,
+                "hash": hashlib.sha256("\x00".join(t for _, t in views).encode()).hexdigest()[:16],
+            })
+    # related 目標補進 links：「相關：」從正文搬到 frontmatter 後，一跳鄰居不能因此變少
+    live = {e["relpath"] for e in entries}
+    for e in entries:
+        for target, _ in e["related"]:
+            r = resolve_entry_ref(target, live)
+            if r and r not in e["links"]:
+                e["links"].append(r)
+    return entries
+
+
+def unreviewed_paths():
+    """尚未進入已審 trunk（origin/main）的條目路徑。
+
+    push 閘門守的是「內容有沒有外流」，但一條原則**生效的時點是它被檢索到**，而檢索讀的是
+    工作目錄不是 origin/main。所以寫完的當下它就已經在影響判斷了，而且完全靜默——這正是
+    Decisions/source-migration-downstream-drift.md 講的那種失效，只是換到了審查這條軸上。
+
+    修法不是禁止使用（同一輪寫下的原則本來就該當輪拿來用），是**讓它不靜默**：撈出來時標
+    〔未審〕，引用它的人就知道這條還沒有人看過。
+    """
+    try:
+        ahead = subprocess.run(["git", "-C", ROOT, "diff", "--name-only", "origin/main...HEAD"],
+                               capture_output=True, text=True, timeout=10)
+        dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return set()          # 不是 git repo 或沒有 origin/main：不標記，不要假裝知道
+    if ahead.returncode != 0:
+        return set()
+    paths = set(ahead.stdout.split())
+    paths |= {ln[3:].strip().strip('"') for ln in dirty.stdout.splitlines() if ln[3:].strip()}
+    return paths
+
+
+def git_out(*args):
+    """跑 git，失敗回 None（不是 git repo、或 git 不在都算失敗，不讓檢索掛掉）。"""
+    try:
+        r = subprocess.run(["git", "-C", ROOT, *args],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+# recall 讀工作目錄，lint／tree／eval 量工作目錄。工作目錄飄掉的時候這幾個數字
+# 全部不可比，而現有的檢查一道都不會因此變紅——那正是不產生訊號的缺陷入口。
+DRIFT_WATCHED = ("recall", "shape", "lint", "tree", "eval")
+
+
+def baseline_drift():
+    """工作目錄與 origin/main 的落差。回一串要印的話，沒事回空 list。
+
+    它問的是「工作目錄是不是在你以為的位置」，不問「條目內容對不對」。所以這一項
+    不報不代表 eval 的數字可比，只代表基準沒飄。
+
+    只比可數的事實，不做判斷：HEAD 指到哪、本機 main 與 origin/main 差幾個 commit、
+    當前分支的基準是不是 origin/main。三者都沒有偽陽性空間。查詢句是不是動作句、
+    這一輪該不該寫條目那種要語意判斷的，一律不收，理由見
+    guard-must-cover-every-writer 的「偽陽性太多時收窄適用範圍」。
+
+    兩個刻意的設計：
+
+    - **雙向比，不只比落後。** 本機 main 領先 origin/main 代表有 commit 沒推出去，
+      別的 session 看不到它，照樣會從一個不完整的基準開分支。只查落後會漏掉這一邊。
+    - **在分支上本身不報。** write-procedure step 7 要求寫入一律走分支，把「HEAD 不在
+      main」報成異常等於要求人去做流程還沒輪到的事。報的是基準過期，跟在不在分支上無關。
+    """
+    if not git_out("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"):
+        return []                      # 沒有設 origin，或還沒 fetch 過
+    msgs = []
+
+    head = git_out("symbolic-ref", "--short", "-q", "HEAD")
+    head = head.strip() if head else None
+    if head is None:
+        msgs.append("HEAD 是 detached，工作目錄不屬於任何分支")
+
+    counts = git_out("rev-list", "--left-right", "--count", "main...origin/main")
+    if counts and len(counts.split()) == 2:
+        ahead, behind = (int(x) for x in counts.split())
+        if behind:
+            msgs.append(f"本機 main 落後 origin/main {behind} 個 commit，"
+                        f"拿它開的分支基準是舊的")
+        if ahead:
+            msgs.append(f"本機 main 領先 origin/main {ahead} 個 commit，"
+                        f"有東西還沒推出去，別的 session 看不到")
+
+    if head and head != "main":
+        base = git_out("merge-base", "HEAD", "origin/main")
+        tip = git_out("rev-parse", "origin/main")
+        if base and tip and base.strip() != tip.strip():
+            n = git_out("rev-list", "--count", "HEAD..origin/main")
+            msgs.append(f"分支 {head} 的基準比 origin/main 舊 "
+                        f"{n.strip() if n else '?'} 個 commit")
+    return msgs
+
+
+def unmerged_branches(base="main"):
+    out = git_out("branch", "--no-merged", base, "--format=%(refname:short)")
+    if out is None:
+        return []
+    return [b.strip() for b in out.splitlines() if b.strip()]
+
+
+def load_branch_entries(working):
+    """未合併分支上的條目。
+
+    存在的理由：`recall` 只讀工作目錄，所以一條原則寫進自己的分支之後，就從後續
+    dedupe 的視野裡消失了——正是 dedupe 要防的事。內容與工作目錄相同的略過（沒有
+    新資訊），只回傳「這個分支上才有」或「這個分支上長得不一樣」的那些。
+    """
+    seen = {e["hash"] for e in working}
+    entries = []
+    for br in unmerged_branches():
+        listing = git_out("ls-tree", "-r", "--name-only", br, "--", *SCAN_DIRS)
+        if not listing:
+            continue
+        for relpath in listing.splitlines():
+            relpath = relpath.strip()
+            if not relpath.endswith(".md"):
+                continue
+            layer = relpath.split("/", 1)[0]
+            if layer not in SCAN_DIRS:
+                continue
+            text = git_out("show", f"{br}:{relpath}")
+            if text is None:
+                continue
+            fm, body = parse_frontmatter(text)
+            views = build_views(fm, body, layer)
+            h = hashlib.sha256("\x00".join(x for _, x in views).encode()).hexdigest()[:16]
+            if h in seen:
+                continue          # 與工作目錄同內容，不重複計入
+            seen.add(h)
+            entries.append({
+                "relpath": f"{relpath}@{br}",
+                "layer": layer,
+                "stem": os.path.basename(relpath)[:-3],
+                "fm": fm,
+                "body": body,
+                "links": [],      # 分支上的連結可能指到尚不存在的檔案，不參與鄰居展開
+                "upstream": [],
+                "views": views,
+                "hash": h,
+                "branch": br,
+            })
+    return entries
+
+
+def memory_index_paths():
+    if not os.path.exists(MEMORY_PATH):
+        return []
+    with open(MEMORY_PATH, encoding="utf-8") as f:
+        return re.findall(
+            r"\]\((Models/[^)]+\.md|Decisions/[^)]+\.md|Frameworks/[^)]+\.md"
+            r"|Expressions/[^)]+\.md)\)", f.read())
+
+
+# ---------------------------------------------------------------- 詞彙表
+
+GLOSSARY_PATH = os.path.join(ROOT, "GLOSSARY.md")
+
+
+def github_anchor(heading):
+    """GitHub 式錨點：小寫、去標點、空白轉連字號。詞彙表標題慣例是 ASCII 術語本名。"""
+    h = re.sub(r"[^\w一-鿿 ]", "", heading.strip().lower())
+    return h.replace(" ", "-")
+
+
+def glossary_sections():
+    """回傳 {anchor: {"term", "backrefs"}}。backrefs 取自各節的「棧內引用」行。"""
+    if not os.path.exists(GLOSSARY_PATH):
+        return {}
+    sections, current = {}, None
+    with open(GLOSSARY_PATH, encoding="utf-8") as f:
+        text = f.read()
+    # HTML 註解裡的內容不算術語。骨架的格式範例住在註解裡，
+    # 不跳過的話它會變成一個沒有反向引用的幽靈術語，而空棧第一次 lint 就紅
+    for line in re.sub(r"<!--.*?-->", "", text, flags=re.S).splitlines(True):
+        if True:
+            m = re.match(r"^## (.+)$", line)
+            if m:
+                current = github_anchor(m.group(1))
+                sections[current] = {"term": m.group(1).strip(), "backrefs": []}
+            elif current and line.startswith("棧內引用"):
+                sections[current]["backrefs"] = [
+                    os.path.normpath(t) for t in re.findall(r"\]\(([^)#]+)\)", line)]
+    return sections
+
+
+def glossary_usages():
+    """全 repo 指向 GLOSSARY.md#錨點 的連結：{anchor: set(repo 相對路徑)}。"""
+    usages = {}
+    files = [("README.md", os.path.join(ROOT, "README.md"))]
+    # tools/context/ 的片段是保證載入通道的正本，判準會從 README 搬進去，
+    # 所以詞彙表的雙向檢查要看得到它——看不到的那一側會靜默漂移。
+    ctx = os.path.join(ROOT, "tools", "context")
+    if os.path.isdir(ctx):
+        files += [(f"tools/context/{fn}", os.path.join(ctx, fn))
+                  for fn in sorted(os.listdir(ctx)) if fn.endswith(".md")]
+    for layer in SCAN_DIRS:
+        d = os.path.join(ROOT, layer)
+        if not os.path.isdir(d):
+            continue
+        files += [(f"{layer}/{fn}", os.path.join(d, fn))
+                  for fn in sorted(os.listdir(d)) if fn.endswith(".md")]
+    for relpath, path in files:
+        # 檔案不在就跳過。剛 init 的棧還沒有 README.md，那不是缺陷
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for anchor in re.findall(r"\]\((?:\.\./)*GLOSSARY\.md#([\w一-鿿-]+)\)", text):
+            usages.setdefault(anchor, set()).add(relpath)
+    return usages
+
+
+# ---------------------------------------------------------------- 向量
+
+def embed(texts):
+    payload = json.dumps({"model": EMBED_MODEL, "input": texts}).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/embed", data=payload, headers={"Content-Type": "application/json"})
+    try:
+        data = json.load(urllib.request.urlopen(req, timeout=EMBED_TIMEOUT))
+    except (urllib.error.URLError, OSError) as e:
+        die(f"連不上 Ollama（{OLLAMA_URL}）：{e}\n"
+            f"  → 檢索降級：改讀 MEMORY.md（功能降級但不失效）\n"
+            f"  → 恢復方式：ollama serve；模型未安裝時 ollama pull {EMBED_MODEL}")
+    vectors = data.get("embeddings")
+    if not vectors:
+        die(f"Ollama 有回應但沒有 embeddings 欄位：{json.dumps(data)[:200]}\n"
+            f"  這通常代表 {EMBED_MODEL} 沒裝或裝壞了。\n"
+            f"  → 先跑：ollama pull {EMBED_MODEL}\n"
+            f"  → 仍失敗就改讀 MEMORY.md，檢索降級但不失效")
+    return [normalize(v) for v in vectors]
+
+
+def normalize(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def pack(vec):
+    return base64.b64encode(array.array("f", vec).tobytes()).decode()
+
+
+def unpack(blob):
+    a = array.array("f")
+    a.frombytes(base64.b64decode(blob))
+    return a
+
+
+def ensure_index(entries, force=False, verbose=True, index_path=None):
+    """回傳 relpath -> [(kind, vec)]。只重嵌內容雜湊變了的條目。"""
+    idx = {"model": EMBED_MODEL, "entries": {}}
+    index_path = index_path or INDEX_PATH
+    if os.path.exists(index_path) and not force:
+        try:
+            with open(index_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if loaded.get("model") == EMBED_MODEL and loaded.get("schema") == 2:
+                idx = loaded
+        except (json.JSONDecodeError, OSError):
+            pass  # 索引壞掉就整份重建，它是純衍生物
+    idx["schema"] = 2
+
+    cached = idx["entries"]
+    stale = [e for e in entries if cached.get(e["relpath"], {}).get("hash") != e["hash"]]
+    if stale:
+        if verbose:
+            what = "建立索引" if len(stale) == len(entries) else "索引過期，重嵌"
+            n_views = sum(len(e["views"]) for e in stale)
+            print(f"[{what} {len(stale)}/{len(entries)} 筆、{n_views} 個視角]", file=sys.stderr)
+        flat = [(e, k, t) for e in stale for k, t in e["views"]]
+        for i in range(0, len(flat), 24):
+            chunk = flat[i:i + 24]
+            for (e, kind, _), vec in zip(chunk, embed([t for _, _, t in chunk])):
+                slot = cached.setdefault(e["relpath"], {"hash": e["hash"], "views": []})
+                if slot.get("hash") != e["hash"]:
+                    slot.update({"hash": e["hash"], "views": []})
+                slot["views"].append([kind, pack(vec)])
+
+    live = {e["relpath"] for e in entries}
+    for gone in [p for p in cached if p not in live]:
+        del cached[gone]
+
+    if stale or force:
+        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(idx, f)
+    return {p: [(k, unpack(b)) for k, b in v["views"]] for p, v in cached.items()}
+
+
+def best(qvec, views, kinds=None):
+    """max-pool：回傳 (最高相似度, 命中的視角 kind)。串接會稀釋，取最大值不會。"""
+    cand = [(dot(qvec, v), k) for k, v in views if kinds is None or k in kinds]
+    return max(cand) if cand else (0.0, "")
+
+
+# ---------------------------------------------------------------- 指令
+
+def load_cached_vecs():
+    """唯讀載入既有索引，不重嵌、不寫檔。回傳 (vecs, 過期清單, 無快取清單)。
+
+    給 --stale-ok 用：計畫模式（禁止改動系統）或趕時間時，寧可用舊向量也不觸發
+    幾十分鐘的重嵌。過期與缺席都要明列——靜默地用舊資料，跟靜默地漏資料一樣糟。
+    """
+    if not os.path.exists(INDEX_PATH):
+        return None, [], []
+    try:
+        with open(INDEX_PATH, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if loaded.get("schema") != 2 or loaded.get("model") != EMBED_MODEL:
+            return None, [], []
+    except (json.JSONDecodeError, OSError):
+        return None, [], []
+    cached = loaded.get("entries", {})
+    vecs = {p: [(k, unpack(b)) for k, b in v["views"]] for p, v in cached.items()}
+    return vecs, cached, None
+
+
+def cmd_recall(args):
+    entries = load_entries()
+    stale_note = ""
+    if args.stale_ok:
+        vecs, cached, _ = load_cached_vecs()
+        if vecs is None:
+            die("--stale-ok 需要既有索引；索引不存在或格式不符，改跑 tools/stack index")
+        stale = [e["stem"] for e in entries
+                 if e["relpath"] in cached and cached[e["relpath"]].get("hash") != e["hash"]]
+        missing = [e["stem"] for e in entries if e["relpath"] not in cached]
+        entries = [e for e in entries if e["relpath"] in cached]
+        parts = []
+        if stale:
+            parts.append(f"{len(stale)} 筆內容已變、用舊向量比對（{', '.join(stale[:4])}"
+                         + ("…" if len(stale) > 4 else "") + "）")
+        if missing:
+            parts.append(f"{len(missing)} 筆全新、未納入（{', '.join(missing[:4])}"
+                         + ("…" if len(missing) > 4 else "") + "）")
+        if parts:
+            stale_note = "\n  ⚠ 唯讀模式：" + "；".join(parts)
+        args.no_branches = True   # 分支條目必然要現嵌，唯讀模式一律跳過
+    else:
+        vecs = ensure_index(entries, verbose=not args.quiet)
+
+    # 未合併分支上的條目也要進 dedupe 視野（見 load_branch_entries 的 docstring）。
+    # 用獨立索引檔，才不會與工作目錄的索引互相淘汰而反覆重嵌。
+    branch_entries, branch_note = [], ""
+    if not args.no_branches:
+        branch_entries = load_branch_entries(entries)
+        if branch_entries:
+            vecs.update(ensure_index(branch_entries, verbose=not args.quiet,
+                                     index_path=BRANCH_INDEX_PATH))
+            n_br = len({e["branch"] for e in branch_entries})
+            branch_note = f"（含 {len(branch_entries)} 筆來自 {n_br} 條未合併分支）"
+        else:
+            brs = unmerged_branches()
+            if brs:
+                branch_note = f"（{len(brs)} 條未合併分支，內容與工作目錄相同）"
+
+    entries = entries + branch_entries
+    qvec = embed([args.query])[0]
+
+    scored = []
+    for e in entries:
+        score, kind = best(qvec, vecs[e["relpath"]])
+        scored.append((score, kind, e))
+    scored.sort(key=lambda t: -t[0])
+    hits = scored[:args.k]
+    hit_paths = {e["relpath"] for _, _, e in hits}
+
+    n_views = sum(len(v) for v in vecs.values())
+    # 未審有兩個來源，都要標：工作目錄裡尚未進 origin/main 的，與未合併分支上的。
+    # 只標其中一種等於讓另一種靜默——那正是這兩個功能各自要防的事。
+    unreviewed = unreviewed_paths()
+    print(f"掃描 {len(entries)} 筆／{n_views} 個視角{branch_note}，命中 top-{args.k}：\n")
+    for score, kind, e in hits:
+        if e.get("branch"):
+            mark = f"  〔未審 · {e['branch']}〕"
+        else:
+            mark = "  〔未審〕" if e["relpath"] in unreviewed else ""
+        print(f"  {score:.3f}  {e['relpath']}  [{kind}]{mark}")
+        print(f"         {e['fm'].get('description', '(無 description)')}")
+    n_un = sum(1 for _, _, e in hits
+               if e.get("branch") or e["relpath"] in unreviewed)
+    if n_un:
+        print(f"\n  ⚠ 這次命中有 {n_un} 筆〔未審〕——尚未合進 origin/main，還沒有人看過。"
+              f"可以用，但引用時要說它未審。")
+
+    # 一跳連結鄰居：作者手接的連結帶著向量抓不到的關係
+    neighbours = []
+    for _, _, e in hits:
+        for link in e["links"]:
+            if link not in hit_paths and link not in neighbours:
+                neighbours.append(link)
+    if neighbours:
+        by_path = {e["relpath"]: e for e in entries}
+        print("\n一跳連結鄰居（命中條目自己指向的）：")
+        for n in neighbours:
+            desc = by_path[n]["fm"].get("description", "") if n in by_path else "！連結指不到"
+            print(f"  · {n} — {desc}")
+
+    names = ", ".join(
+        os.path.basename(e["relpath"].split("@", 1)[0]) +
+        ("〔未審〕" if (e.get("branch") or e["relpath"] in unreviewed) else "")
+        for _, _, e in hits)
+    # 時戳讓這一行可以被查新鮮度。使用契約說它是唯一能事後看出來的欄位，
+    # 但在它帶時戳之前，沒有任何東西查得出它是哪一次檢索留下的。
+    import datetime
+    _ts = datetime.datetime.now().isoformat(timespec="seconds")
+    print(f"\n決策棧檢索：{_ts} 命中 {names}{stale_note}")
+
+    neigh_stems = [by_path[n]["stem"] for n in neighbours
+                   if n in by_path] if neighbours else []
+    log_usage(args.query, [e["stem"] for _, _, e in hits], neigh_stems)
+
+
+# ---------------------------------------------------------------- 使用記錄
+
+USAGE_PATH = os.path.join(ROOT, "tools", ".usage.tsv")
+
+
+def _session_tag():
+    """把同一輪的查詢分在一起用的標籤。只要分得開，不需要跨機器唯一。
+
+    各 harness 的 session 變數名不同，所以列成一張表往下找；STACK_SESSION 是留給
+    人手動接的口子，排最前面。都沒有就退回父行程 id。
+
+    取雜湊不取原值：這個欄位的內容由 harness 決定，取雜湊之後不論它塞什麼進來，
+    落在 log 裡的都只是一個分組鍵。
+    """
+    import hashlib
+    for var in ("STACK_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "OPENCODE_SESSION_ID"):
+        v = os.environ.get(var)
+        if v:
+            return hashlib.sha1(v.encode()).hexdigest()[:8]
+    return f"p{os.getppid()}"
+
+
+def log_usage(query, stems, neighbours=()):
+    """每次 recall 記一行：日期、查詢、直接命中、鄰居觸及。淘汰判準的機械訊號（§各層契約）。
+
+    **兩欄分開記，因為它們是兩種不同的「被用到」。** 直接命中＝向量檢索撈到；鄰居觸及＝
+    命中條目手接的連結把它帶進視野。Model 層常常只走鄰居觸及這一欄。實測過一筆 Model
+    直接命中 0 次，卻在同期真的影響了判斷並被追加 confirmed。
+    只算 top-k 會系統性低估 Model 層，讓淘汰判準誤殺它們。
+
+    不進版控（查詢會含工作語彙，是去識別化風險；且它是機器本地的事件資料）。
+    寫入失敗靜默略過——log 壞掉不可以毀掉檢索。**只寫不讀回排序**：讓使用量回饋
+    權重會變成自我強化的人氣模型（Frameworks/agent-memory-design.md 第 3 條）。
+    """
+    try:
+        import datetime
+        with open(USAGE_PATH, "a", encoding="utf-8") as f:
+            # 新欄位接在最後面，舊列的前四欄位置不動，讀的那一側才不必分版本。
+            f.write(f"{datetime.date.today().isoformat()}\t"
+                    f"{query[:120].replace(chr(9), ' ')}\t{','.join(stems)}\t"
+                    f"{','.join(neighbours)}\t"
+                    f"{datetime.datetime.now().isoformat(timespec='seconds')}\t"
+                    f"{_session_tag()}\n")
+    except OSError:
+        pass
+    _stamp_last_recall(query)
+
+
+LAST_RECALL_PATH = os.path.join(ROOT, "tools", ".last-recall")
+
+
+def _stamp_last_recall(query):
+    """記下最近一次 recall 的時間與查詢句，供外發前的檢查點讀。
+
+    跟 .usage.tsv 分開：那份是長期的使用統計，這份是「剛剛有沒有檢索過」的即時狀態，
+    只有一行、會被覆蓋。同樣不進版控、寫入失敗靜默略過。
+    """
+    try:
+        import datetime
+        with open(LAST_RECALL_PATH, "w", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}\t"
+                    f"{query[:200].replace(chr(9), ' ')}\n")
+    except OSError:
+        pass
+
+
+TRACE_RE = re.compile(r"決策棧檢索：(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)?\s*命中")
+
+
+def cmd_prose(args):
+    """量一段文字的句子形狀。輸入可以是 repo 之外的任何檔案。
+
+    寫作契約訂在 WRITING §寫作指南，`lint` 每次都查，但它只查 repo 裡的條目。要離開
+    對話的產出（留言、票面、訊息、文件）從來沒有被同一把尺量過，於是它們會停在契約
+    寫下之前的狀態。這一支就是那把尺，拿出去用。
+
+    **不給及格與不及格。** 印可數的事實，加上本棧條目的數字當對照線。對照線用現算的，
+    不寫死：寫死的常數會跟著條目改寫而過期，而過期的基準比沒有基準更糟。
+
+    刻意不收「括號補充」與「不是X是Y」。量過一批真實的票卡留言，括號裡幾乎全是識別碼、
+    `檔名:行號`、日期區間與列舉範圍，是承載訊息的；做成檢查會製造大量誤判，而誤判會讓
+    整組訊號被略過。理由與 AI_TELLS 那段註解同源，**是刻意不做，不是漏掉**。
+    """
+    try:
+        with open(args.file, encoding="utf-8", errors="replace") as f:
+            body = f.read()
+    except OSError as e:
+        die(f"讀不到 {args.file}：{e}\n"
+            f"  → 確認路徑拼字，或改用絕對路徑。這支指令吃 repo 之外的檔案")
+    n, avg, over, dash = prose_stats(body)
+    if not n:
+        print(f"{args.file}\n  沒有可量的句子（可能整份是程式碼、表格或清單）。")
+        return 0
+    print(f"{args.file}")
+    print(f"  句數 {n}　句均 {avg:.1f} 字　超過 40 字 {over:.1f}%　句中破折號 {dash:.2f}/千字")
+    # 40 字這個刻度與下面的對照線都是拿中文條目量出來的。非中文的文字照樣算得出數字，
+    # 但那個數字不能跟對照線比：跨語言的差距是語言的差距，不是產出的差距。
+    zh = len(re.findall(r"[\u4e00-\u9fff]", prose_body(body)))
+    if zh < len(re.sub(r"\s+", "", prose_body(body))) * 0.3:
+        print("  這份文字不以中文為主。40 字的刻度與下面的對照線都是拿中文條目量的，"
+              "不要跨語言比。")
+        return 0
+
+    try:
+        entries = load_entries()
+    except SystemExit:
+        entries = []
+    if entries:
+        en, eavg, eover, edash = prose_stats("\n".join(e["body"] for e in entries))
+        print(f"  對照：這座棧的 {len(entries)} 筆條目 "
+              f"句均 {eavg:.1f} 字、超過 40 字 {eover:.1f}%、破折號 {edash:.2f}/千字")
+        print(f"  它們都經過 WRITING §寫作指南 的同一份契約。差距大就是契約沒有跟著這份產出走。")
+    return 0
+
+
+def cmd_trace(args):
+    """查一份計畫或設計提案裡的留痕行是哪一次檢索留下的。
+
+    使用契約說留痕行由工具產出、偽造不了，是唯一能事後看出來的欄位。缺的是沒有東西
+    查它新不新：一份計畫可以大改三輪而那一行不動，它仍然為真，只是早就不是這份計畫
+    的檢索紀錄。
+
+    **不給及格與不及格。** 「差幾天算太舊」是判斷，訂一個沒有根據的天數會讓判斷者
+    系統性高估（Models/a-criterion-must-terminate.md）。這裡印可數的事實，判斷留給
+    讀的人。唯一決定性的結論是留痕行不存在，而那一條使用契約已經寫死：沒有這一行
+    等於沒檢索。
+    """
+    import datetime
+    path = args.file
+    if not os.path.exists(path):
+        print(f"找不到檔案：{path}")
+        return 1
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    m = TRACE_RE.search(text)
+    if not m:
+        print(f"{path}\n  ✗ 沒有留痕行。使用契約：沒有這一行等於沒檢索。")
+        return 1
+    if not m.group(1):
+        print(f"{path}\n  留痕行沒有時戳，是舊格式。它證明檢索發生過，但證明不了"
+              f"是哪一次。重跑一次 recall 並重貼。")
+        return 0
+
+    trace = datetime.datetime.fromisoformat(m.group(1))
+    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+    later = 0
+    if os.path.exists(USAGE_PATH):
+        with open(USAGE_PATH, encoding="utf-8") as f:
+            for line in f:
+                p = line.rstrip("\n").split("\t")
+                if len(p) > 4 and len(p[4]) >= 19:
+                    try:
+                        later += datetime.datetime.fromisoformat(p[4]) > trace
+                    except ValueError:
+                        pass
+
+    gap = (mtime - trace).total_seconds() / 3600
+    print(f"{path}")
+    print(f"  留痕行的檢索時刻  {trace.isoformat(timespec='seconds')}")
+    print(f"  檔案最後修改      {mtime.isoformat(timespec='seconds')}")
+    print(f"  兩者相差          {gap:.1f} 小時"
+          + ("（檔案比留痕舊，那一行是貼進來的舊資料）" if gap < 0 else ""))
+    print(f"  該時刻之後的檢索  {later} 次"
+          + ("　←　留痕行不是最新的那一次檢索" if later else ""))
+    return 0
+
+
+def cmd_usage_queries():
+    """查詢側的視角：這一輪問了什麼、問了幾次、同一句問了幾遍。
+
+    cmd_usage 答的是「哪些條目冷掉了」，那是條目側。這一支答的是「檢索紀律有沒有
+    做到」，而在它出現之前這一側完全沒有報告。使用契約的第二個觸發時機（動作成形的
+    那一刻）被跳過時不留任何痕跡，跳過十次跟做到十次看起來一樣。
+
+    **只印原文，不判定查詢句是動作句還是主題句。** 那要判斷語意角色，字面比對做不到，
+    硬做會產生大量誤判，而誤判會讓整組訊號被略過（guard-must-cover-every-writer）。
+    人讀一眼就分得出來。唯一的判定是重複次數，因為它可以數。
+    """
+    if not os.path.exists(USAGE_PATH):
+        print(f"還沒有使用記錄（{USAGE_PATH} 不存在）。recall 每次查詢會自動記一行。")
+        return 0
+    groups = {}
+    with open(USAGE_PATH, encoding="utf-8") as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 3:
+                continue
+            ts = p[4] if len(p) > 4 else ""
+            groups.setdefault((p[0], p[5] if len(p) > 5 else ""), []).append((ts, p[1]))
+
+    for (day, sess) in sorted(groups):
+        rows = sorted(groups[(day, sess)])
+        tag = f"session {sess}" if sess else "session —（舊格式，無時間與 session 欄）"
+        print(f"\n{day}  {tag}  {len(rows)} 次")
+        for ts, q in rows:
+            print(f"  {ts[11:19] if len(ts) >= 19 else '  —  ':>8}  {q}")
+
+        counts = {}
+        for _, q in rows:
+            counts[q] = counts.get(q, 0) + 1
+        rep = sorted(((c, q) for q, c in counts.items() if c >= 3), reverse=True)
+        if rep:
+            print("  重複 3 次以上：" +
+                  "；".join(f"{q}（{c}）" for c, q in rep))
+            print("    同一句問這麼多遍，代表 recall 被當成量測儀器在用，不是判斷工具。")
+
+        stamps = [t for t, _ in rows if len(t) >= 19]
+        if len(stamps) >= 2:
+            import datetime
+            ds = sorted(datetime.datetime.fromisoformat(t) for t in stamps)
+            gaps = sorted((b - a).total_seconds() / 60 for a, b in zip(ds, ds[1:]))
+            print(f"  相鄰兩次間隔中位數：{gaps[len(gaps) // 2]:.0f} 分")
+
+    print("\n判讀方式：查詢句描述的是正要做的動作，還是任務的主題。"
+          "\n主題句撈到的是領域原則，動作句才撈得到約束產出形狀的原則"
+          "（Decisions/query-the-act-not-the-topic.md）。這一支不替你判，它把原文攤開。")
+    return 0
+
+
+def cmd_usage(args):
+    """哪些條目從未被任何檢索情境需要——淘汰候選的下界訊號。
+
+    log 起點之前的缺席不是證據（Decisions/absence-of-signal-is-not-evidence-of-state.md），
+    所以覆蓋區間一定印出來；區間太短時零命中不構成候選。
+    """
+    if getattr(args, "queries", False):
+        return cmd_usage_queries()
+    entries = load_entries()
+    hits, near, first, last = {}, {}, None, None
+    if os.path.exists(USAGE_PATH):
+        with open(USAGE_PATH, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                # 舊格式 3 欄、之後 4 欄、現在 6 欄。缺的欄位視為空，
+                # 不讓既有 log 失效，也不回填：舊列寫下的那一刻沒有這兩欄，回填是捏造。
+                if len(parts) < 3:
+                    continue
+                day, _, stems = parts[0], parts[1], parts[2]
+                neigh = parts[3] if len(parts) == 4 else ""
+                first, last = first or day, day
+                for bucket, field in ((hits, stems), (near, neigh)):
+                    for s in field.split(","):
+                        if s:
+                            rec = bucket.setdefault(s, [0, day])
+                            rec[0] += 1
+                            rec[1] = day
+    if not first:
+        print(f"還沒有使用記錄（{USAGE_PATH} 不存在或為空）。recall 每次查詢會自動記一行。")
+        return 0
+
+    import datetime
+    span = (datetime.date.fromisoformat(last) - datetime.date.fromisoformat(first)).days + 1
+    print(f"log 覆蓋 {first} ～ {last}（{span} 天）、"
+          f"直接命中 {sum(c for c, _ in hits.values())} 次、"
+          f"鄰居觸及 {sum(c for c, _ in near.values())} 次\n")
+
+    def both(e):
+        h = hits.get(e["stem"], [0, "—"])
+        n = near.get(e["stem"], [0, "—"])
+        last_seen = max(d for d in (h[1], n[1]) if d != "—") if (h[0] or n[0]) else "—"
+        return h[0], n[0], last_seen
+
+    rows = sorted(((*both(e), e) for e in entries),
+                  key=lambda t: (t[0] + t[1], t[0], t[3]["relpath"]))
+    print(f"  {'直接':>4}  {'鄰居':>4}  {'最後觸及':>10}  條目")
+    for h, n, lastday, e in rows:
+        print(f"  {h:>4}  {n:>4}  {lastday:>10}  {e['relpath']}")
+
+    # 淘汰候選＝兩欄都零。只看直接命中會誤殺主要靠連結被帶進視野的 Model 層。
+    zero = [e for h, n, _, e in rows if h == 0 and n == 0 and not e["fm"].get("confirmed")]
+    print(f"\n直接與鄰居皆零、且無 confirmed：{len(zero)} 筆")
+    if span < args.window:
+        print(f"  log 覆蓋僅 {span} 天 < 觀察窗 {args.window} 天——**還不構成淘汰候選**，"
+              f"缺席要累積夠久才是訊號。")
+    elif zero:
+        print(f"  覆蓋已滿 {args.window} 天，以下是淘汰候選（人工判準見 SPEC §各層契約·淘汰）：")
+        for e in zero:
+            print(f"  · {e['relpath']} — {e['fm'].get('description', '')[:60]}")
+    return 0
+
+
+def cmd_tree(args):
+    """依 upstream 印格狀結構——Model 為根、Framework 居中、Decision 為葉。
+
+    多親條目在每個親底下都出現並標 ⊕（格狀是多對多，樹只是它的一種攤法）。
+    這是瀏覽視角；查找走 recall，資料夾維持扁平（SPEC §各層契約）。
+    """
+    entries = load_entries()
+    children = {}
+    for e in entries:
+        for u in e["upstream"]:
+            children.setdefault(u, []).append(e)
+
+    def line(e, depth):
+        multi = " ⊕" if len(e["upstream"]) > 1 else ""
+        print("    " * depth + f"[{e['layer'][0]}] {e['stem']}{multi}")
+
+    def walk(path, depth):
+        for c in sorted(children.get(path, []), key=lambda x: (x["layer"], x["stem"])):
+            line(c, depth)
+            walk(c["relpath"], depth + 1)
+
+    for m in sorted((e for e in entries if e["layer"] == "Models"), key=lambda x: x["stem"]):
+        print(f"[M] {m['stem']}")
+        walk(m["relpath"], 1)
+
+    orphan_f = sorted((e for e in entries if e["layer"] == "Frameworks" and not e["upstream"]),
+                      key=lambda x: x["stem"])
+    orphan_d = sorted((e for e in entries if e["layer"] == "Decisions" and not e["upstream"]),
+                      key=lambda x: x["stem"])
+    if orphan_f:
+        print(f"\n未接基準的 Frameworks（缺口 {len(orphan_f)} 筆）：")
+        for f in orphan_f:
+            print(f"[F] {f['stem']}")
+            walk(f["relpath"], 1)
+    if orphan_d:
+        print(f"\n未接基準的 Decisions（缺口 {len(orphan_d)} 筆）：")
+        for d in orphan_d:
+            print(f"  [D] {d['stem']}")
+
+    n_multi = sum(1 for e in entries if len(e["upstream"]) > 1)
+    print(f"\n{len(entries)} 筆；⊕ 多親 {n_multi} 筆（在每個親下都出現一次）")
+    return 0
+
+
+def claim_sims(entries, vecs):
+    """條目兩兩的主張相似度。只比 claim 視角——例子像不構成該合併。"""
+    claims = {e["relpath"]: [v for k, v in vecs[e["relpath"]] if k == "claim"] or
+                            [v for _, v in vecs[e["relpath"]]] for e in entries}
+    paths = [e["relpath"] for e in entries]
+    sims = {}
+    for i in range(len(paths)):
+        for j in range(i + 1, len(paths)):
+            sims[(i, j)] = max(dot(a, b) for a in claims[paths[i]] for b in claims[paths[j]])
+    return paths, sims
+
+
+def ancestor_map(entries):
+    """每筆條目沿 upstream 遞移展開的祖先集合（多對多，深度上限防環）。"""
+    up = {e["relpath"]: list(e["upstream"]) for e in entries}
+    anc = {}
+
+    def walk(rp, depth=0):
+        if rp in anc:
+            return anc[rp]
+        if depth > 6:
+            return set()
+        s = set()
+        for p in up.get(rp, []):
+            s.add(p)
+            s |= walk(p, depth + 1)
+        if depth == 0:
+            anc[rp] = s
+        return s
+
+    for rp in up:
+        walk(rp)
+    return anc
+
+
+def kinship(a, b, anc):
+    """兩筆條目的族譜關係：父子/祖孫、兄弟（共上游），或 None（無關係）。
+
+    存在理由：上下游本來就語意相近——一筆 Decision 是它上游骨架的實例，向量距離當然近。
+    收斂候選若不扣掉族譜對，三層結構越完整、假陽性越多。實測過一輪，候選幾乎全是刻意建的
+    父子或兄弟，門檻等於失去診斷力。真正要看的是「很像卻沒有族譜關係」。
+    """
+    aa, ab = anc.get(a, set()), anc.get(b, set())
+    if b in aa or a in ab:
+        return "父子"
+    shared = aa & ab
+    if shared:
+        return "兄弟"
+    return None
+
+
+def cmd_shape(args):
+    entries = load_entries()
+    vecs = ensure_index(entries, verbose=True)
+    paths, sims = claim_sims(entries, vecs)
+    n = len(paths)
+    by_path = {e["relpath"]: e for e in entries}
+
+    anc = ancestor_map(entries)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for (i, j), s in sims.items():
+        if s >= args.threshold and kinship(paths[i], paths[j], anc) is None:
+            a, b = find(i), find(j)
+            if a != b:
+                parent[a] = b
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    multi = sorted([c for c in clusters.values() if len(c) > 1], key=len, reverse=True)
+
+    print(f"\n=== 收斂候選：最相似的 {args.pairs} 對（門檻 {args.threshold}）===")
+    print("兩筆很近＝同一個檢索情境會同時命中 → 該合併成一筆，或抽一筆上游模型出來")
+    print("**已有族譜關係的對不算候選**——上下游與兄弟本來就該相近，那是結構不是缺陷；")
+    print("要看的是標 ★ 的那些：很像、卻沒有任何族譜關係。\n")
+    n_kin = 0
+    for (i, j), s in sorted(sims.items(), key=lambda t: -t[1])[:args.pairs]:
+        rel = kinship(paths[i], paths[j], anc)
+        if rel:
+            n_kin += 1
+            flag = f"  （{rel}，非候選）"
+        else:
+            flag = "  ★ 收斂候選" if s >= args.threshold else ""
+        print(f"  {s:.3f}  {by_path[paths[i]]['stem']}")
+        print(f"         {by_path[paths[j]]['stem']}{flag}")
+    print(f"\n  列出 {args.pairs} 對中 {n_kin} 對有族譜關係（已被結構解釋），"
+          f"{args.pairs - n_kin} 對待判。")
+
+    print(f"\n=== 群（門檻 {args.threshold} 以上連通）===")
+    if not multi:
+        print("  無。全部條目在此門檻下彼此獨立——若預期該有群，把門檻調低再跑一次。")
+    for c in multi:
+        inner = [sims[(min(a, b), max(a, b))] for a in c for b in c if a < b]
+        print(f"\n  群大小 {len(c)}，群內平均 {sum(inner) / len(inner):.3f}：")
+        for i in c:
+            print(f"    · {paths[i]}")
+
+    # 拆分候選用「內在凝聚度」——一筆條目自己的視角彼此有多像。低＝它自己的段落在講不同的
+    # 東西＝混了多個關注點＝SRP 違反。這是內在度量，不依賴分群結果。
+    #
+    # 「近鄰跨兩群」不能當偵測器：門檻之下幾乎每筆都自成一群，條件變成恆真，
+    # 標出絕大多數條目。一個標記幾乎所有東西的檢查等於沒有檢查。
+    print("\n=== 拆分候選：內在凝聚度最低的幾筆 ===")
+    print("一筆自己的段落彼此不像＝它同時服務多個檢索情境 → SRP 判準說該拆")
+    print("讀法：Frameworks 天生就是並列教訓，低凝聚度屬正常；**Models／Decisions 低就是缺陷**，")
+    print("而視角數異常多又凝聚度低的，是「好幾份東西擠在一個檔」而不是「一份有很多段」。\n")
+    rows = []
+    for e in entries:
+        vs = [v for _, v in vecs[e["relpath"]]]
+        if len(vs) < 3:
+            continue
+        pairs = [dot(vs[i], vs[j]) for i in range(len(vs)) for j in range(i + 1, len(vs))]
+        rows.append((sum(pairs) / len(pairs), min(pairs), len(vs), e))
+    rows.sort()
+    print(f"  {'平均':>6}{'最低':>7}{'視角':>5}  條目")
+    for mean, lo, nv, e in rows[:args.split]:
+        print(f"  {mean:>6.3f}{lo:>7.3f}{nv:>5}  {e['relpath']}")
+    if rows:
+        print(f"\n  （對照：凝聚度最高的是 {rows[-1][3]['stem']} {rows[-1][0]:.3f}——單一主張長這樣）")
+
+
+# 可升級區：會被複製給別人的東西。這裡的每一句都要換一台機器、換一個人仍成立。
+SHIPPABLE_GLOBS = ["README.md", "README.en.md", "SPEC.md", "WRITING.md", "examples/*.md", "tools/stack", "tools/outward-write-guard", "tools/hooks/*",
+                   "tools/context/*.md", "tools/context/MANIFEST.tsv", "skills/*/*.md",
+                   "tools/local.example/*", "tools/stack.config.toml.example",
+                   "templates/*.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "LICENSE",
+                   ".github/*.md", ".github/ISSUE_TEMPLATE/*"]
+# 只對一個時點或一台機器成立的句子會用到的字。命中就擋。
+SHIP_FAIL = [
+    (r"\b20\d\d-\d\d-\d\d\b", "日期"),
+    (r"(?<![\w#])#\d{2,}\b", "PR 號"),
+    (r"\bv\d+\.\d+\b", "版本號"),
+    (r"這台", "這台"), (r"曾", "曾"), (r"當時", "當時"),
+    (r"上次", "上次"), (r"前一次", "前一次"), (r"已知的", "已知的"),
+    (r"(?<!自)我", "第一人稱"),   # 排除「自我」
+    (r"\]\((?:\.\./)*(?:Models|Frameworks|Decisions|Expressions)/[^)]+\.md", "連進條目"),
+]
+SHIP_WARN = [(r"目前", "目前"), (r"自己", "自己")]
+
+
+def shippable_files():
+    import glob
+    out = []
+    for g in SHIPPABLE_GLOBS:
+        for path in sorted(glob.glob(os.path.join(ROOT, g))):
+            if os.path.isfile(path):
+                out.append(os.path.relpath(path, ROOT))
+    return out
+
+
+def read_denylist():
+    if not os.path.exists(DENYLIST_PATH):
+        return []
+    with open(DENYLIST_PATH, encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+
+def shippable_scan():
+    """回傳 (fails, warns)，每項 (相對路徑, 行號, 類別, 該行片段)。
+
+    引號內與程式碼區塊不掃：引號裡是被引述的例子，不是這句話自己在說。
+    """
+    fails, warns = [], []
+    deny = read_denylist()
+    for rel in shippable_files():
+        with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as f:
+            lines = f.read().split("\n")
+        in_code = False
+        for i, raw in enumerate(lines, 1):
+            if raw.strip().startswith("```"):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+            line = re.sub(r"「[^」]*」", "「」", raw)
+            line = re.sub(r'"[^"]*"', '""', line)
+            snippet = raw.strip()[:60]
+            # recorded: 與 confirmed: 的值照定義就是日期，不是散文裡會過期的時間快照。
+            # 日期規則要擋的是後者。這兩個結構欄位跳過日期那一條，其餘照查。
+            fm_date = re.match(r"\s*(recorded|confirmed):", line)
+            for pat, kind in SHIP_FAIL:
+                if kind == "日期" and fm_date:
+                    continue
+                if re.search(pat, line):
+                    fails.append((rel, i, kind, snippet))
+                    break
+            else:
+                for pat, kind in SHIP_WARN:
+                    if re.search(pat, line):
+                        warns.append((rel, i, kind, snippet))
+                        break
+            for pat in deny:
+                if re.search(pat, raw):
+                    fails.append((rel, i, "具名清單", snippet))
+                    break
+    return fails, warns
+
+
+# 每一行問題訊息都寫明了哪個檔、哪個欄位、哪裡不對，但「知道哪裡壞」與「知道下一步做什麼」
+# 是兩件事。使用者遇到問題卻不知道下一步，是這支工具最該避免的狀態。
+#
+# 只印真的出現的那幾類，不印整面牆：一份每次都吐一堆無關修法的輸出會被停止閱讀。
+FIX_HINTS = [
+    ("不在 MEMORY.md 索引裡",
+     "在 MEMORY.md 對應的 H2 分節加一行 `- [標題](路徑) — 摘要`。沒進索引等於這筆不存在"),
+    ("MEMORY.md 指到不存在的檔案",
+     "檔案改名或刪掉了。改索引那一行的路徑，或把檔案補回來"),
+    ("MEMORY.md 重複列出",
+     "同一個檔被列了兩次，刪掉其中一行"),
+    ("缺 frontmatter",
+     "欄位清單與各欄的寫法見 WRITING §frontmatter"),
+    ("與檔名不符",
+     "`name:` 要與檔名（去掉 .md）逐字相同。改其中一邊"),
+    ("與資料夾不符",
+     "`type:` 要與所在資料夾一致。搬檔案，或改這個欄位"),
+    ("不在受控詞彙",
+     "這個軸只收表上那幾個值，見 SPEC §Expressions 的軸"),
+    ("指不到",
+     "目標改名或刪掉了。改指向，或把目標補回來。路徑寫 repo 相對路徑、檔名或 stem 都可以"),
+    ("缺分界句",
+     "`related:` 的 `—` 後面要寫「那筆答什麼；本筆答什麼」。沒有分界句就只是一條沒說明的連結"),
+    ("方向必須嚴格向上",
+     "decision 只能指 Frameworks/ 或 Models/，framework 只能指 Models/，model 不設 upstream"),
+    ("要指進三層",
+     "expression 的 upstream 選填，但填了就要指進 Models/、Frameworks/ 或 Decisions/"),
+    ("沒有粗體規則句",
+     "第一節的第一句要是 `**…**`，那一句就是檢索比對的對象。格式見 WRITING §正文結構"),
+    ("分節不符",
+     "各層的固定分節與順序見 WRITING §正文結構。暫時沒內容的節保留標題並寫「待補」"),
+    ("首句含接續記號",
+     "首句只講做什麼，一個子句。為什麼與怎麼做各自成節"),
+    ("正文仍有「相關：」段",
+     "把它搬進 frontmatter 的 `related:`，格式見 WRITING §對照其他條目"),
+    ("GLOSSARY.md",
+     "詞彙表與條目是雙向的：條目連過去，術語的「棧內引用」也要列回來。缺任一邊都算不一致"),
+    ("MANIFEST.tsv 指到不存在的片段",
+     "片段檔被搬走或改名了。改 MANIFEST.tsv 那一列，或把檔案放回去"),
+]
+
+
+def cmd_lint_shippable():
+    fails, warns = shippable_scan()
+    by_file = {}
+    for rel, i, kind, snip in fails:
+        by_file.setdefault(rel, []).append((i, kind, snip))
+    for rel in shippable_files():
+        hits = by_file.get(rel, [])
+        w = sum(1 for r, *_ in warns if r == rel)
+        mark = "✗" if hits else ("△" if w else "✓")
+        print(f"  {mark} {rel}：{len(hits)} 擋／{w} 提醒")
+        for i, kind, snip in hits[:8]:
+            print(f"      L{i} [{kind}] {snip}")
+        if len(hits) > 8:
+            print(f"      … 另 {len(hits) - 8} 處")
+    print(f"\n可升級區檢查：{len(fails)} 擋／{len(warns)} 提醒，"
+          f"共 {len(shippable_files())} 檔。判準：換一台機器、換一個人，這句話還成立嗎。")
+    return 1 if fails else 0
+
+
+def cmd_lint(args):
+    if getattr(args, "shippable", False):
+        return cmd_lint_shippable()
+    entries = load_entries()
+    problems = []
+    # notices 與 problems 分開：索引類訊息講的是不進版控、會自己痊癒的衍生物，
+    # 不是內容缺陷。混在一起會讓 pre-commit 閘門對無缺陷的狀態亮紅燈，而假陽性的閘門
+    # 會被繞過（--no-verify），那比沒有閘門糟。
+    notices = []
+    live = {e["relpath"] for e in entries}
+
+    # 1. 索引 ↔ 檔案雙向一致。沒進索引等於這條原則不存在。
+    listed = memory_index_paths()
+    for p in listed:
+        if p not in live:
+            problems.append(f"MEMORY.md 指到不存在的檔案：{p}")
+    for p in sorted(live - set(listed)):
+        problems.append(f"檔案不在 MEMORY.md 索引裡（等於不存在）：{p}")
+    for p in sorted({x for x in listed if listed.count(x) > 1}):
+        problems.append(f"MEMORY.md 重複列出：{p}")
+
+    # 2. frontmatter 與規則句
+    for e in entries:
+        fm = e["fm"]
+        for field in REQUIRED_FIELDS:
+            if not fm.get(field):
+                problems.append(f"{e['relpath']}：缺 frontmatter `{field}`")
+        if fm.get("name") and fm["name"] != e["stem"]:
+            problems.append(f"{e['relpath']}：name `{fm['name']}` 與檔名不符")
+        expected = SCAN_DIRS[e["layer"]]
+        if fm.get("type") and fm["type"] != expected:
+            problems.append(f"{e['relpath']}：type `{fm['type']}` 與資料夾不符（應為 `{expected}`）")
+        if e["layer"] == EXPRESSIONS:
+            # 軸是組織鍵：管 lint、管索引分組、管矩陣看得出哪一格沒填。檢索走 description。
+            for axis, vocab in EXPRESSION_AXES.items():
+                val = fm.get(axis, "").strip()
+                if not val:
+                    problems.append(f"{e['relpath']}：缺 frontmatter `{axis}`（軸定位它在哪一格）")
+                elif val not in vocab:
+                    problems.append(f"{e['relpath']}：`{axis}: {val}` 不在受控詞彙"
+                                    f"（{'／'.join(vocab)}）")
+        if not first_rule(e["body"]):
+            problems.append(f"{e['relpath']}：正文沒有粗體規則句（檢索比對的就是這句）")
+
+    # 2b. 寫作契約 v2：首句一句一意、每層固定分節、related 具名。
+    # 舊條目還沒改寫完之前這三項只提醒；--strict 才擋。改寫完後 pre-commit 改用 --strict。
+    strict = getattr(args, "strict", False)
+    sink = problems if strict else notices
+    bad_rule, bad_sections, legacy_related, dense = [], [], [], []
+    tells = {}
+    for e in entries:
+        rule = first_rule(e["body"])
+        if rule and any(t in rule for t in RULE_FORBIDDEN):
+            bad_rule.append(e["relpath"])
+        want = SECTIONS[e["layer"]]
+        have = entry_sections(e["body"])
+        if have[:len(want)] != want:
+            bad_sections.append(e["relpath"])
+        if re.search(r"\n\s*(?:相關|延伸|參見)[：:]", e["body"]):
+            legacy_related.append(e["relpath"])
+        d, a = density(e["body"])
+        if d > DENSITY_MID_DASH_PER_K or a > DENSITY_AVG_SENTENCE:
+            dense.append((e["relpath"], d, a))
+        for name, n in ai_tells(e["body"]):
+            tells.setdefault(name, []).append((e["relpath"], n))
+    if bad_rule:
+        sink.append(f"首句規則句含接續記號（——／；／：），一句要只講一個意思：{len(bad_rule)} 筆"
+                    + ("" if strict else f"，例：{'、'.join(bad_rule[:3])}"))
+        if strict:
+            problems.extend(f"{p}：首句含接續記號" for p in bad_rule)
+    if bad_sections:
+        sink.append(f"分節不符該層固定順序：{len(bad_sections)} 筆"
+                    + ("" if strict else f"，例：{'、'.join(bad_sections[:3])}"))
+        if strict:
+            problems.extend(f"{p}：分節不符 {SECTIONS[p.split('/')[0]]}" for p in bad_sections)
+    if legacy_related:
+        sink.append(f"正文仍有「相關：」段，要搬到 frontmatter related:：{len(legacy_related)} 筆")
+        if strict:
+            problems.extend(f"{p}：正文仍有「相關：」段" for p in legacy_related)
+    if dense:
+        dense.sort(key=lambda t: -(t[1] / DENSITY_MID_DASH_PER_K + t[2] / DENSITY_AVG_SENTENCE))
+        notices.append(f"密度警訊（句中破折號>{DENSITY_MID_DASH_PER_K}/千 或 句均>"
+                       f"{DENSITY_AVG_SENTENCE}）：{len(dense)} 筆，最高："
+                       + "；".join(f"{p}（{d:.1f}／{a:.0f}）" for p, d, a in dense[:3]))
+    for name in sorted(tells):
+        hits = sorted(tells[name], key=lambda t: -t[1])
+        total = sum(n for _, n in hits)
+        tail = "（這個形式常常就是主張本身，讀過再決定）" if name == "不是X是Y" else ""
+        notices.append(f"AI 語標記「{name}」：{total} 次／{len(hits)} 筆{tail}，最多："
+                       + "；".join(f"{p}（{n}）" for p, n in hits[:3]))
+    # related 目標一律要解得到——這是新欄位，沒有舊資料要遷，直接當缺陷
+    for e in entries:
+        for target, note in e["related"]:
+            if not resolve_entry_ref(target, live):
+                problems.append(f"{e['relpath']}：related 指不到 {target}")
+            # 分界句是 related 存在的理由：沒有它就只是一條沒說明為什麼的連結。
+            # 格式只要求 `—` 後面有字。分號不是要件，句號或逗號分界一樣算數。
+            elif not note:
+                problems.append(f"{e['relpath']}：related {target} 缺分界句")
+
+    # 3. 條目間連結解析得到
+    for e in entries:
+        for link in e["links"]:
+            if link not in live and not os.path.exists(os.path.join(ROOT, link)):
+                problems.append(f"{e['relpath']}：連結指不到 {link}")
+
+    # 4. 上行格狀結構：方向嚴格向上、目標存在。覆蓋率是缺口報告不是錯誤——
+    #    目標形狀是每筆 Decision 有 Framework/Model、每筆 Framework 有 Model，逐輪收斂補齊。
+    rank = {"Models": 0, "Frameworks": 1, "Decisions": 2}
+    for e in entries:
+        for u in e["upstream"]:
+            if u not in live:
+                problems.append(f"{e['relpath']}：upstream 指不到 {u}")
+                continue
+            ulayer = u.split("/", 1)[0]
+            if e["layer"] not in rank:
+                # Expressions 不在推導鏈上，沒有「更上游的層」可比。它的 upstream 是選填的
+                # 出處標註：這個形狀是依據哪條判斷來的。只要求指進三層。
+                if ulayer not in rank:
+                    problems.append(f"{e['relpath']}：upstream {u} 要指進三層")
+                continue
+            if rank[ulayer] >= rank[e["layer"]]:
+                problems.append(f"{e['relpath']}：upstream {u} 不是更上游的層（方向必須嚴格向上）")
+        if e["layer"] == "Models" and e["upstream"]:
+            problems.append(f"{e['relpath']}：Models 條目不設 upstream（它就是最上游）")
+
+    # 5. 詞彙表雙向一致。單向的索引會靜默漂移——正是 source-migration-downstream-drift
+    #    那種失效，所以兩個方向都機械比對：用了沒列 → 補「棧內引用」；列了沒用 → 清單過期。
+    sections = glossary_sections()
+    usages = glossary_usages()
+    for anchor in sorted(set(usages) - set(sections)):
+        problems.append(f"GLOSSARY.md 沒有錨點 #{anchor}，但這些檔連過去："
+                        + ", ".join(sorted(usages[anchor])))
+    for anchor, sec in sections.items():
+        used, listed_refs = usages.get(anchor, set()), set(sec["backrefs"])
+        for p in sorted(used - listed_refs):
+            problems.append(f"GLOSSARY.md #{anchor}：{p} 有連過來但「棧內引用」沒列")
+        for p in sorted(listed_refs - used):
+            problems.append(f"GLOSSARY.md #{anchor}：「棧內引用」列了 {p} 但該檔沒有連過來")
+        if not sec["backrefs"]:
+            problems.append(f"GLOSSARY.md #{anchor}：缺「棧內引用」清單（沒人引用的術語該移除）")
+
+    # 6. MANIFEST 指到的片段要存在。純 repo 內部檢查——機器層的接線狀態放在 doctor，
+    #    放這裡會讓「這台機器還沒接線」在 pre-commit 亮紅燈，假紅會養出 --no-verify。
+    manifest = read_manifest()
+    if manifest:
+        for r in manifest:
+            frag = r.get("fragment", "")
+            if r.get("primitive") == "unwired" or frag in ("", "-"):
+                continue
+            if not os.path.exists(os.path.join(ROOT, frag)):
+                problems.append(f"MANIFEST.tsv 指到不存在的片段：{frag}（{r.get('harness')}）")
+
+    # 7. 索引過期（靜默失效，所以要主動報）
+    if os.path.exists(INDEX_PATH):
+        try:
+            with open(INDEX_PATH, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if loaded.get("schema") != 2:
+                notices.append("索引是舊格式，下次 recall 會整份重建")
+            else:
+                cached = loaded.get("entries", {})
+                stale = [e["relpath"] for e in entries
+                         if cached.get(e["relpath"], {}).get("hash") != e["hash"]]
+                if stale:
+                    notices.append(f"向量索引過期 {len(stale)} 筆（recall 會自動重嵌）："
+                                    + ", ".join(stale[:5]) + ("…" if len(stale) > 5 else ""))
+        except (json.JSONDecodeError, OSError):
+            notices.append("向量索引壞掉，下次 recall 會整份重建")
+    else:
+        notices.append("向量索引還沒建立（跑 stack index）")
+
+    counts = {layer: sum(1 for e in entries if e["layer"] == layer) for layer in SCAN_DIRS
+              if any(e["layer"] == layer for e in entries)}
+    print(f"條目 {len(entries)} 筆（" + "／".join(f"{k} {v}" for k, v in counts.items())
+          + f"），視角 {sum(len(e['views']) for e in entries)} 個"
+          + f"，交叉連結 {sum(len(e['links']) for e in entries)} 條"
+          + f"，詞彙表 {len(sections)} 詞")
+
+    # 上行覆蓋率（缺口報告）：孤兒不是錯誤，是下一輪收斂的原料
+    for layer in ("Decisions", "Frameworks"):
+        pool = [e for e in entries if e["layer"] == layer]
+        have = [e for e in pool if e["upstream"]]
+        orphans = [e["stem"] for e in pool if not e["upstream"]]
+        print(f"upstream 覆蓋：{layer} {len(have)}/{len(pool)}"
+              + (f"　缺口：{', '.join(orphans[:6])}" + ("…" if len(orphans) > 6 else "")
+                 if orphans else "　（全連）"))
+
+    if notices:
+        print()
+        for n in notices:
+            print(f"  · {n}")
+
+    if problems:
+        print(f"\n發現 {len(problems)} 個問題：")
+        for p in problems:
+            print(f"  ✗ {p}")
+        hints = [h for sig, h in FIX_HINTS if any(sig in p for p in problems)]
+        if hints:
+            print("\n怎麼修：")
+            for h in hints:
+                print(f"  → {h}")
+        return 1
+    print("全綠。")
+    return 0
+
+
+def cmd_eval(args):
+    """召回率回歸。這是唯一能證明工具沒有偷偷變差的東西——改嵌入、換模型、大批拆分後都要跑。"""
+    path = os.path.join(ROOT, "tools", "regression.tsv")
+    cases = []
+    if not os.path.exists(path):
+        print(f"這台安裝沒有回歸語料（{os.path.relpath(path, ROOT)} 不在）。eval 不適用。")
+        return 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or "\t" not in line:
+                continue
+            q, expect = line.rstrip("\n").split("\t", 1)
+            cases.append((q, [x.strip() for x in expect.split(",") if x.strip()]))
+
+    if not cases:
+        print("回歸語料裡沒有題目。eval 不適用。題目怎麼加見該檔檔頭。")
+        return 0
+    entries = load_entries()
+    vecs = ensure_index(entries, verbose=True)
+    ranks, worst = [], []
+    for query, expected in cases:
+        qvec = embed([query])[0]
+        order = sorted(((best(qvec, vecs[e["relpath"]])[0], e) for e in entries),
+                       key=lambda t: -t[0])
+        stems = [e["stem"] for _, e in order]
+        for exp in expected:
+            r = stems.index(exp) + 1 if exp in stems else 999
+            ranks.append(r)
+            mark = "✓" if r <= 3 else ("△" if r <= args.k else "✗")
+            print(f"  {mark} rank {r:>3}  {exp}")
+            if r > 3:
+                worst.append((r, exp, query))
+    top3 = sum(1 for r in ranks if r <= 3)
+    topk = sum(1 for r in ranks if r <= args.k)
+    avg = sum(ranks) / len(ranks)
+    print(f"\ntop-3 命中 {top3}/{len(ranks)}　top-{args.k} 命中 {topk}/{len(ranks)}"
+          f"　平均 rank {avg:.1f}")
+    # 基線存檔、不抄進文件。抄進散文的數字會跟實際值分岔。
+    if os.path.exists(EVAL_BASELINE_PATH):
+        try:
+            b = json.load(open(EVAL_BASELINE_PATH, encoding="utf-8"))
+            print(f"基線（{b.get('date')}，{b.get('entries')} 筆）：top-3 {b.get('top3')}/{b.get('n')}"
+                  f"　top-{args.k} {b.get('topk')}/{b.get('n')}　平均 rank {b.get('avg')}")
+        except (OSError, ValueError):
+            pass
+    if getattr(args, "save_baseline", False):
+        json.dump({"date": datetime.date.today().isoformat(), "entries": len(entries),
+                   "n": len(ranks), "top3": top3, "topk": topk, "k": args.k,
+                   "avg": round(avg, 2)},
+                  open(EVAL_BASELINE_PATH, "w", encoding="utf-8"), ensure_ascii=False)
+        print(f"基線已存 {os.path.relpath(EVAL_BASELINE_PATH, ROOT)}")
+    if worst:
+        print("\n掉出 top-3 的（改動後這幾筆變差就是退步）：")
+        for r, exp, q in sorted(worst, reverse=True):
+            print(f"  rank {r:>3}  {exp}  ←  {q[:40]}…")
+
+    # 檢索吸子：在多個彼此無關的查詢都擠進 top-3 的條目。它不是排序的問題，是那一筆
+    # 同時服務太多檢索情境（SRP 違反），而視角越多＝抽獎券越多。**要拆的是條目，不是調參數。**
+    attractor = {}
+    for (query, expected), qvec in zip(cases, [embed([q]) [0] for q, _ in cases]):
+        order = sorted(((best(qvec, vecs[e["relpath"]])[0], e) for e in entries),
+                       key=lambda t: -t[0])[:3]
+        for _, e in order:
+            if e["stem"] not in expected:
+                attractor[e["stem"]] = attractor.get(e["stem"], 0) + 1
+    noisy = sorted(((c, s) for s, c in attractor.items() if c >= 3), reverse=True)
+    if noisy:
+        views = {e["stem"]: len(e["views"]) for e in entries}
+        print("\n檢索吸子（擠進不相關查詢 top-3 的次數 ≥3）——這是拆分候選，不是調參數的理由：")
+        for count, stem in noisy:
+            print(f"  {count} 次 / {len(cases)} 題　{stem}（{views[stem]} 個視角）")
+    return 0
+
+
+CONFIG_PATH = os.path.join(ROOT, "tools", "stack.config.toml")
+
+
+def read_config():
+    """本機設定。檔不在回空 dict，這不是錯誤。
+
+    住在 tools/，跟 .index.json、local/ 同一類：本機狀態，被 tools/.gitignore 蓋住，
+    升級覆蓋可升級區時不會衝突。
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_config(args):
+    """印設定值。查不到回 1。呼叫端據此判定本機沒設這項。"""
+    node = read_config()
+    for part in args.key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return 1
+        node = node[part]
+    print(json.dumps(node, ensure_ascii=False, sort_keys=True)
+          if isinstance(node, dict) else node)
+    return 0
+
+
+def cmd_root(args):
+    """印 repo root。契約片段裡的 cd "$(stack root)" 靠它，片段因此不寫死路徑。"""
+    print(ROOT)
+    return 0
+
+
+MEMORY_SKELETON = """# 決策棧索引
+
+歸檔判準與內容分層見 [README.md](README.md)。一行一筆，新增條目時同步更新這份索引。
+
+## Models — 核心信念：為什麼這樣思考
+
+## Frameworks — 思考骨架與技法：怎麼下判斷
+
+## Decisions — 由具體事件揭露出的判斷原則
+
+## Expressions — 用詞、語氣與內容取捨：這一格該怎麼寫
+"""
+
+GLOSSARY_SKELETON = """# 詞彙表
+
+外部具名術語的全名、定義與原始定義出處集中在這裡。條目內文照用縮寫，讀者不用離站查找。
+
+**收詞判準**：外部具名框架、方法論、非日常縮寫才收。日常工程詞（API、CLI、PR）不收。
+**雙向索引**：條目內文首次出現術語時連到本表錨點，本表每個術語列回引用它的檔案。
+兩邊的一致性由 `stack lint` 機械檢查，不靠自律。術語依字母序排列。
+
+<!-- 格式範例，用到第一個術語時照這個形狀寫，然後刪掉這段註解：
+
+## bus factor
+
+一個專案失去幾位關鍵成員就會停擺的人數。數字越小，知識集中度越高、風險越大。
+出處：[Bus factor — Wikipedia](https://en.wikipedia.org/wiki/Bus_factor)
+棧內引用：[某條目](<層資料夾>/<檔名>.md)
+-->
+"""
+
+
+def cmd_init(args):
+    """建立一個新的決策棧。已存在的檔案一律不覆蓋。
+
+    這是唯一在 assert_repo_root 之前跑的子命令：它要建的正是那道檢查要找的目錄。
+    """
+    made, kept = [], []
+
+    def ensure_dir(rel):
+        path = os.path.join(ROOT, rel)
+        if os.path.isdir(path):
+            kept.append(rel + "/")
+        else:
+            os.makedirs(path, exist_ok=True)
+            open(os.path.join(path, ".gitkeep"), "a").close()
+            made.append(rel + "/")
+
+    def ensure_file(rel, content):
+        path = os.path.join(ROOT, rel)
+        if os.path.exists(path):
+            kept.append(rel)
+            return
+        os.makedirs(os.path.dirname(path) or ROOT, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        made.append(rel)
+
+    for d in list(SCAN_DIRS) + ["Pending"]:
+        ensure_dir(d)
+    ensure_file("MEMORY.md", MEMORY_SKELETON)
+    ensure_file("GLOSSARY.md", GLOSSARY_SKELETON)
+
+    # 本機區與本機設定：範本進版控，實檔不進
+    example_dir = os.path.join(ROOT, "tools", "local.example")
+    if os.path.isdir(example_dir):
+        for fn in sorted(os.listdir(example_dir)):
+            src_p = os.path.join(example_dir, fn)
+            if os.path.isfile(src_p):
+                ensure_file(os.path.join("tools", "local", fn),
+                            open(src_p, encoding="utf-8").read())
+    cfg_example = os.path.join(ROOT, "tools", "stack.config.toml.example")
+    if os.path.exists(cfg_example):
+        ensure_file(os.path.join("tools", "stack.config.toml"),
+                    open(cfg_example, encoding="utf-8").read())
+
+    for rel in made:
+        print(f"  ✓ 建了 {rel}")
+    if kept:
+        print(f"  — 已存在，沒動：{'、'.join(kept)}")
+
+    print()
+    steps = []
+    hooks_path = (git_out("config", "core.hooksPath") or "").strip()
+    if hooks_path == "tools/hooks":
+        steps.append(("OK", "pre-commit", "hooksPath 已是 tools/hooks"))
+    elif git_out("rev-parse", "--git-dir") is None:
+        steps.append(("TODO", "pre-commit", "這裡還不是 git repo　→ git init 之後再跑一次 stack init"))
+    else:
+        git_out("config", "core.hooksPath", "tools/hooks")
+        steps.append(("DONE", "pre-commit", "hooksPath 設為 tools/hooks"))
+    if not (git_out("config", "--local", "user.email") or "").strip():
+        steps.append(("TODO", "commit 身分",
+                      "repo-local user.email 未設，pre-commit 的身分閘門形同虛設"
+                      "　→ git config user.email <你的個人信箱>"))
+    try:
+        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
+        if any(m.get("name", "").split(":")[0] == EMBED_MODEL for m in tags.get("models", [])):
+            steps.append(("OK", "Ollama", f"{EMBED_MODEL} 在"))
+        else:
+            steps.append(("TODO", "Ollama", f"缺模型　→ ollama pull {EMBED_MODEL}"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        steps.append(("TODO", "Ollama",
+                      f"連不上 {OLLAMA_URL}。沒有它 recall 會明確失敗，不會靜默降級"
+                      f"　→ ollama serve，然後 ollama pull {EMBED_MODEL}"))
+    for level, label, detail in steps:
+        print(f"  [{level}] {label}：{detail}")
+
+    entries = load_entries()
+    print()
+    if entries:
+        print(f"這個棧已經有 {len(entries)} 筆條目。init 只補缺的東西，沒有覆蓋任何內容。")
+        return 0
+    print("棧是空的。空的棧檢索不到東西，而且第一筆條目在規格上寫不出來：")
+    print("  寫入程序 step 3 要求新 Decision 掛 Framework、Framework 掛 Model，")
+    print("  但這裡還沒有任何 Model 可以掛。")
+    print()
+    print("下一步跑 bootstrap，它會帶你從既有素材反向萃取出最小自洽集合，")
+    print("並說明 bootstrap 批次內對 step 3 的例外怎麼用：")
+    print("  skills/decision-stack-bootstrap/SKILL.md")
+    return 0
+
+
+# 可升級區：template 擁有的路徑。upgrade 只覆蓋這些，contribute 只接受這些。
+# 與 SHIPPABLE_GLOBS 分開：那一組管「哪些散文要受去個人化檢查」，這一組管
+# 「哪些檔案的擁有者是 template」。兩者重疊但不相等，合併會讓其中一邊被另一邊拖著改。
+UPGRADABLE_GLOBS = [
+    "README.md", "README.en.md", "SPEC.md", "WRITING.md", "examples/*.md", "LICENSE", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", ".gitignore",
+    "tools/stack", "tools/outward-write-guard", "tools/VERSION", "tools/.gitignore",
+    "tools/hooks/*", "tools/context/*.md", "tools/context/MANIFEST.tsv",
+    "tools/testdata/*/*", "tools/local.example/*", "tools/stack.config.toml.example",
+    "templates/*.md", "skills/*/SKILL.md",
+    ".github/*.md", ".github/*/*",
+]
+# 永遠不跨界的東西。列出來是為了讓「為什麼不是可升級區」看得見，不是給程式判斷用的。
+PRIVATE_NOTE = ("Models/、Frameworks/、Decisions/、Expressions/、Pending/ 的條目，"
+                "MEMORY.md、GLOSSARY.md、tools/local/、tools/stack.config.toml、"
+                "tools/regression.tsv")
+
+
+def upgradable_files():
+    import glob
+    out = []
+    for g in UPGRADABLE_GLOBS:
+        for path in sorted(glob.glob(os.path.join(ROOT, g))):
+            if os.path.isfile(path):
+                out.append(os.path.relpath(path, ROOT))
+    return sorted(set(out))
+
+
+def in_upgradable(rel):
+    import fnmatch
+    return any(fnmatch.fnmatch(rel, g) for g in UPGRADABLE_GLOBS)
+
+
+def local_version():
+    try:
+        return open(VERSION_PATH, encoding="utf-8").read().strip()
+    except OSError:
+        return "(未知)"
+
+
+def template_ref(remote, branch):
+    """確認 template remote 在、抓得動。回傳 (ref, "")；抓不到回 (None, 原因)。"""
+    if git_out("remote", "get-url", remote) is None:
+        return None, (f"沒有名為 {remote} 的 remote。先接上 template："
+                      f"\n  git remote add {remote} <template repo 的 URL>")
+    if git_out("fetch", remote, branch) is None:
+        return None, f"git fetch {remote} {branch} 失敗。檢查網路與存取權。"
+    ref = f"{remote}/{branch}"
+    if git_out("rev-parse", "--verify", ref) is None:
+        return None, f"抓到了但解不出 {ref}。"
+    return ref, ""
+
+
+def remote_version(ref):
+    out = git_out("show", f"{ref}:tools/VERSION")
+    return out.strip() if out else "(未知)"
+
+
+def cmd_upgrade(args):
+    """把 template 的可升級區拉進一條分支。條目一個都不碰。
+
+    整包覆蓋之所以安全，是因為可升級區不含任何內容。不自動合併，走既有的 trunk 閘門。
+    """
+    ref, why = template_ref(args.remote, args.branch)
+    if ref is None:
+        die(why)
+    print(f"本機工具版本 {local_version()}　template {remote_version(ref)}\n")
+
+    theirs_all = [r for r in (git_out("ls-tree", "-r", "--name-only", ref) or "").split()
+                  if in_upgradable(r)]
+    changed, added = [], []
+    for rel in sorted(set(upgradable_files()) | set(theirs_all)):
+        theirs = git_out("show", f"{ref}:{rel}")
+        if theirs is None:
+            continue                       # template 沒有這個檔，不刪本機的
+        try:
+            mine = open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        except OSError:
+            added.append(rel)
+            continue
+        if mine != theirs:
+            changed.append(rel)
+
+    if not changed and not added:
+        print("可升級區與 template 一致，沒有要拉的東西。")
+        return 0
+    for rel in added:
+        print(f"  + {rel}（本機沒有）")
+    for rel in changed:
+        print(f"  ~ {rel}")
+    print(f"\n共 {len(changed) + len(added)} 檔。條目、索引、本機區都不在清單裡。")
+
+    if not args.yes:
+        print("\n[dry-run] 沒有動任何檔案。要真的拉請加 --yes。")
+        return 0
+    branch = f"upgrade/{remote_version(ref)}"
+    if git_out("rev-parse", "--verify", branch) is not None:
+        die(f"分支 {branch} 已存在。先處理掉它，或自己換個名字。")
+    if git_out("checkout", "-b", branch) is None:
+        die(f"開不了分支 {branch}。\n"
+            f"  → 先跑 git status 看工作區有沒有未提交的異動\n"
+            f"  → 有的話先 commit 或 stash，再重跑這一支")
+    for rel in changed + added:
+        if git_out("checkout", ref, "--", rel) is None:
+            print(f"  ✗ {rel} 取出失敗")
+    print(f"\n✓ 已開 {branch}，{len(changed) + len(added)} 檔取到工作區並 stage，沒有 commit。")
+    print("  先看過再決定：git diff --cached")
+    print("  確認之後 commit、push、開 PR。合併在人看過 diff 之後。")
+    return 0
+
+
+def cmd_contribute(args):
+    """把本機對可升級區的改動送回 template。私有區的路徑一律拒絕。"""
+    rejected = [p for p in args.paths if not in_upgradable(p)]
+    if rejected:
+        die("這些路徑不在可升級區，不能送回 template：\n  "
+            + "\n  ".join(rejected)
+            + f"\n\n可升級區之外的留在你自己的 repo，包含：{PRIVATE_NOTE}")
+    missing = [p for p in args.paths if not os.path.exists(os.path.join(ROOT, p))]
+    if missing:
+        die("這些檔案不存在：\n  " + "\n  ".join(missing))
+
+    print(f"要送回 template 的 {len(args.paths)} 檔：")
+    for p in args.paths:
+        print(f"  · {p}")
+
+    fails, _ = shippable_scan()
+    hit = [f for f in fails if f[0] in args.paths]
+    print()
+    if hit:
+        print("✗ 去個人化沒過。這些內容會被複製給別人，不能夾帶只對本機或本人成立的文字：")
+        for rel, i, kind, snip in hit[:10]:
+            print(f"    {rel} L{i} [{kind}] {snip}")
+        return 1
+    print("✓ 去個人化過了。換一台機器、換一個人，這幾個檔裡的句子都還成立。")
+
+    topic = args.topic or "contrib"
+    print("\n下一步自己跑。這支工具不替你推送到別人的 repo：")
+    print(f"  git checkout -b contrib/{topic}")
+    print(f"  git add {' '.join(args.paths)}")
+    print("  git commit -s        # -s 是 DCO 的 Signed-off-by，見 CONTRIBUTING")
+    print(f"  git push {args.remote} HEAD:refs/heads/contrib/{topic}")
+    print("  gh pr create -R <template repo>")
+    return 0
+
+
+def cmd_index(args):
+    entries = load_entries()
+    ensure_index(entries, force=True, verbose=True)
+    print(f"索引重建完成：{len(entries)} 筆／{sum(len(e['views']) for e in entries)} 個視角"
+          f" × {EMBED_MODEL}，{os.path.getsize(INDEX_PATH) // 1024} KB")
+
+
+# ---------------------------------------------------------------- 接線體檢
+
+MANIFEST_PATH = os.path.join(ROOT, "tools", "context", "MANIFEST.tsv")
+VERSION_PATH = os.path.join(ROOT, "tools", "VERSION")
+LOCAL_DIR = os.path.join(ROOT, "tools", "local")
+VERIFIED_PATH = os.path.join(LOCAL_DIR, "verified.tsv")
+DENYLIST_PATH = os.path.join(LOCAL_DIR, "denylist.txt")
+EVAL_BASELINE_PATH = os.path.join(ROOT, "tools", ".eval-baseline.json")
+
+
+def read_verified():
+    """tools/local/verified.tsv → {(harness, fragment): 日期}。檔不在回空 dict。
+
+    驗證日期是本機的證明，跟 MANIFEST 的接線意圖分開存。MANIFEST 進版控、對每台機器
+    都一樣；日期不進版控、每台機器一份。
+    """
+    if not os.path.exists(VERIFIED_PATH):
+        return {}
+    out = {}
+    with open(VERIFIED_PATH, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i == 0 or not line.strip() or line.startswith("#"):
+                continue
+            cells = [c.strip() for c in line.rstrip("\n").split("\t")]
+            if len(cells) >= 3 and cells[2] not in ("", "-"):
+                out[(cells[0], cells[1])] = cells[2]
+    return out
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+
+
+def read_manifest(path=MANIFEST_PATH):
+    """讀 MANIFEST.tsv → [dict]。找不到檔回 None——「沒有清單」與「清單是空的」要分得開。"""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        lines = [l.rstrip("\n") for l in f if l.strip() and not l.lstrip().startswith("#")]
+    if not lines:
+        return []
+    header = [h.strip() for h in lines[0].split("\t")]
+    rows = []
+    for line in lines[1:]:
+        cells = line.split("\t")
+        rows.append({h: (cells[i].strip() if i < len(cells) else "")
+                     for i, h in enumerate(header)})
+    return rows
+
+
+def registered_hook_commands(settings_path):
+    """settings.json 裡所有 hook 的 command 字串。**只讀不寫**——那個檔含明文金鑰。"""
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    cmds = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if isinstance(node.get("command"), str):
+                cmds.append(node["command"])
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data.get("hooks", {}))
+    return cmds
+
+
+def pointer_present(target_abs, primitive, fragment_abs):
+    """目標檔裡有沒有指向這個片段的指標。回傳 (found, 說明)。
+
+    原語分開判，因為失效形態不同：import 行是文字（改路徑就靜默失效），
+    instructions[] 是 JSON 陣列（壞路徑很可能被該工具靜默忽略）。
+
+    inherit 走的機制與 import 相同，但它沒有自己的接線點——它宣告「這條通道靠繼承上游
+    指令檔拿到片段」。機械上查的是同一件事（上游那個檔有沒有 import 行），分成獨立一列
+    的理由全在 verified 欄：**上游載入了不等於這條通道也載入了**，那要在該通道自己驗過。
+    """
+    try:
+        text = open(target_abs, encoding="utf-8").read()
+    except OSError as e:
+        return False, f"讀不到目標：{e}"
+    if primitive in ("import", "inherit"):
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("@"):
+                continue
+            if os.path.realpath(os.path.expanduser(line[1:].strip())) == fragment_abs:
+                return True, ("繼承自上游指令檔，import 行在位"
+                              if primitive == "inherit" else "import 行在位")
+        return False, "找不到指向這個片段的 @import 行"
+    if primitive == "instructions[]":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            return False, f"目標不是合法 JSON：{e}"
+        for item in data.get("instructions") or []:
+            if isinstance(item, str) and \
+                    os.path.realpath(os.path.expanduser(item)) == fragment_abs:
+                return True, "instructions[] 列到了"
+        return False, "instructions[] 沒有這個片段"
+    return False, f"不認識的原語 {primitive}"
+
+
+def doctor_manifest_rows(manifest):
+    """逐列檢查 MANIFEST。回傳 [(level, 標籤, 說明)]。"""
+    rows = []
+    verified_local = read_verified()
+    if manifest is None:
+        return [("FAIL", "MANIFEST", f"找不到 {os.path.relpath(MANIFEST_PATH, ROOT)}")]
+    for r in manifest:
+        harness = r.get("harness", "?")
+        primitive = r.get("primitive", "")
+        label = f"{harness}／{os.path.basename(r.get('fragment') or '-')}"
+        if primitive == "unwired":
+            rows.append(("UNWIRED", harness, r.get("note") or "宣告的缺口"))
+            continue
+        frag_rel = r.get("fragment", "")
+        frag_abs = os.path.realpath(os.path.join(ROOT, frag_rel))
+        if not frag_abs.startswith(os.path.realpath(ROOT) + os.sep):
+            rows.append(("FAIL", label, f"片段不在本 repo 之下：{frag_rel}"))
+            continue
+        if not os.path.exists(frag_abs):
+            rows.append(("FAIL", label, f"片段不存在：{frag_rel}"))
+            continue
+        target_abs = os.path.expanduser(r.get("target_path", ""))
+        if not os.path.exists(target_abs):
+            rows.append(("FAIL", label, f"目標不存在：{r.get('target_path')}"))
+            continue
+        found, why = pointer_present(target_abs, primitive, frag_abs)
+        if not found:
+            rows.append(("FAIL", label, f"{why}（{r.get('target_path')}）"))
+            continue
+        verified = verified_local.get((harness, frag_rel), "")
+        if not verified:
+            rows.append(("WARN", label, f"{why}，但本機還沒驗過它真的載入。"
+                                        "在該 harness 開新 session 請它引用只存在片段裡的一句，"
+                                        "引得出再填進 tools/local/verified.tsv"))
+        else:
+            rows.append(("OK", label, f"{why}，{verified} 驗證過真的載入"))
+    return rows
+
+
+def cmd_doctor(args):
+    """接線體檢：純唯讀。回報「規則有沒有真的到得了各 harness」。
+
+    存在的理由：接上了不等於生效，而死接線沒有訊號——`~/.claude/hooks/` 底下就有兩支
+    可執行的 hook 腳本註冊在任何 settings 檔裡都找不到，沒有人發現。
+    """
+    if args.self_test:
+        return doctor_self_test()
+
+    rows = []
+
+    # 1. repo 身分與未推送的積欠
+    branch = (git_out("rev-parse", "--abbrev-ref", "HEAD") or "?").strip()
+    dirty = (git_out("status", "--porcelain") or "").strip()
+    rows.append(("INFO", "repo", f"{ROOT}　branch={branch}"
+                                 + ("　工作區有未提交變更" if dirty else "　工作區乾淨")))
+    unmerged = unmerged_branches()
+    if unmerged:
+        dated = []
+        for b in unmerged:
+            d = (git_out("log", "-1", "--format=%ad", "--date=short", b) or "").strip()
+            dated.append((d, b))
+        dated.sort()
+        rows.append(("WARN", "未合併分支",
+                     f"{len(dated)} 條待審，最舊 {dated[0][0]}（{dated[0][1]}）"
+                     "——數字變大是待辦不是狀態"))
+    else:
+        rows.append(("OK", "未合併分支", "0 條"))
+
+    # 2. pre-commit 閘門（hook 本體跟著 repo 走，hooksPath 是本機設定）
+    hooks_path = (git_out("config", "core.hooksPath") or "").strip()
+    hook_file = os.path.join(ROOT, "tools", "hooks", "pre-commit")
+    if hooks_path != "tools/hooks":
+        rows.append(("FAIL", "pre-commit", f"core.hooksPath={hooks_path or '(未設)'}"
+                                           "　→ git config core.hooksPath tools/hooks"))
+    elif not os.access(hook_file, os.X_OK):
+        rows.append(("FAIL", "pre-commit", "tools/hooks/pre-commit 沒有執行權限"))
+    else:
+        rows.append(("OK", "pre-commit", "hooksPath=tools/hooks，hook 可執行"))
+
+    # 3. 身分閘門要有 repo-local user.email，否則 pre-commit 擋不了跨身分 commit
+    email = (git_out("config", "--local", "user.email") or "").strip()
+    rows.append(("OK", "commit 身分", email) if email else
+                ("FAIL", "commit 身分", "repo-local user.email 未設，身分閘門形同虛設"))
+
+    # 4. 檢索能力：Ollama 不在是降級不是失效，所以 WARN 不 FAIL
+    try:
+        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        if any(n.split(":")[0] == EMBED_MODEL for n in names):
+            rows.append(("OK", "Ollama", f"{OLLAMA_URL}　{EMBED_MODEL} 在"))
+        else:
+            rows.append(("WARN", "Ollama", f"連上了但沒有 {EMBED_MODEL}"
+                                           f"　→ ollama pull {EMBED_MODEL}"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        rows.append(("WARN", "Ollama", f"連不上 {OLLAMA_URL}（{e}）"
+                                       "　→ recall 會明確失敗並提示改讀 MEMORY.md"))
+
+    # 5. 索引新鮮度（純衍生物，過期是 recall 自己會修的事）
+    entries = load_entries()
+    if not os.path.exists(INDEX_PATH):
+        rows.append(("WARN", "向量索引", "還沒建立　→ tools/stack index"))
+    else:
+        try:
+            loaded = json.load(open(INDEX_PATH, encoding="utf-8"))
+            cached = loaded.get("entries", {}) if loaded.get("schema") == 2 else {}
+            stale = [e for e in entries if cached.get(e["relpath"], {}).get("hash") != e["hash"]]
+            rows.append(("OK", "向量索引", f"{len(entries)} 筆，過期 {len(stale)} 筆"
+                                           "（recall 會自動重嵌）"))
+        except (OSError, json.JSONDecodeError):
+            rows.append(("WARN", "向量索引", "壞掉，下次 recall 會整份重建"))
+
+    # 6. 逐列 MANIFEST
+    rows += doctor_manifest_rows(read_manifest())
+
+    # 7. 死接線對帳：有檔沒註冊 / 有註冊沒檔。兩個方向都要，因為兩種都靜默
+    settings = os.path.join(CLAUDE_DIR, "settings.json")
+    cmds = registered_hook_commands(settings)
+    hook_dir = os.path.join(CLAUDE_DIR, "hooks")
+    if cmds is None:
+        rows.append(("WARN", "hook 對帳", f"讀不到 {settings}"))
+    else:
+        joined = "\n".join(cmds)
+        if os.path.isdir(hook_dir):
+            for fn in sorted(os.listdir(hook_dir)):
+                fp = os.path.join(hook_dir, fn)
+                if os.path.isfile(fp) and os.access(fp, os.X_OK) and fn not in joined:
+                    rows.append(("WARN", "死接線", f"~/.claude/hooks/{fn} 可執行但沒有任何"
+                                 f" settings 註冊它。要它生效就在 settings 的 hooks 區加一筆；"
+                                 f"不要了就刪掉這個檔，留著會讓下一個人以為它在跑"))
+        for c in cmds:
+            first = c.split()[0] if c.split() else c
+            if first.startswith(("/", "~")) and not os.path.exists(os.path.expanduser(first)):
+                rows.append(("FAIL", "死接線", f"settings 註冊了不存在的指令：{first}"))
+        guard = os.path.join(ROOT, "tools", "outward-write-guard")
+        rows.append(("OK", "外發守衛", "已註冊為 PreToolUse hook") if guard in joined else
+                    ("WARN", "外發守衛", "tools/outward-write-guard 沒有被註冊為 PreToolUse "
+                     "hook，外發內容不會被攔檢。→ 重跑 tools/stack install --yes"))
+
+    # 工具版本。有接 template remote 就順便比，沒接只報本機
+    mine = local_version()
+    if git_out("remote", "get-url", "template") is not None:
+        theirs = git_out("show", "template/main:tools/VERSION")
+        theirs = theirs.strip() if theirs else None
+        if theirs is None:
+            rows.append(("WARN", "工具版本", f"{mine}　template 那一側讀不到，先 git fetch template"))
+        elif theirs != mine:
+            rows.append(("WARN", "工具版本", f"{mine}　template 是 {theirs}　→ stack upgrade 看差在哪"))
+        else:
+            rows.append(("OK", "工具版本", f"{mine}　與 template 相同"))
+    else:
+        rows.append(("INFO", "工具版本", f"{mine}（沒接 template remote，不比對）"))
+
+    # shim：契約片段寫的是裸名 stack，這條斷了片段就成了死指令
+    level, label, detail = plan_shim(write=False)
+    rows.append(({"PLAN": "WARN", "DONE": "OK"}.get(level, level), label,
+                 detail if level != "PLAN" else detail + "　→ tools/stack install --yes"))
+
+    # 8. 未版控的指令檔：讓「它被改過而我不知道」變成看得見的欄位
+    cmd_md = os.path.join(CLAUDE_DIR, "CLAUDE.md")
+    if os.path.exists(cmd_md):
+        h = hashlib.sha256(open(cmd_md, "rb").read()).hexdigest()[:12]
+        mt = __import__("datetime").datetime.fromtimestamp(
+            os.path.getmtime(cmd_md)).strftime("%Y-%m-%d %H:%M")
+        rows.append(("INFO", "~/.claude/CLAUDE.md",
+                     f"{os.path.getsize(cmd_md)} B　mtime={mt}　sha256={h}（未版控）"))
+
+    order = {"FAIL": 0, "WARN": 1, "UNWIRED": 2, "OK": 3, "INFO": 4}
+    if args.json:
+        print(json.dumps([{"level": l, "label": k, "detail": d} for l, k, d in rows],
+                         ensure_ascii=False, indent=2))
+    else:
+        for level, label, detail in rows:
+            if args.quiet and level in ("OK", "INFO"):
+                continue
+            mark = {"OK": "✓", "WARN": "△", "FAIL": "✗", "UNWIRED": "—", "INFO": "·"}[level]
+            print(f"  {mark} {label}：{detail}")
+
+    n = {k: sum(1 for l, _, _ in rows if l == k) for k in order}
+    print(f"\n決策棧接線：{n['OK']} OK ／ {n['WARN']} WARN ／ {n['FAIL']} FAIL"
+          f" ／ {n['UNWIRED']} UNWIRED(宣告)")
+    return 2 if n["FAIL"] else (1 if n["WARN"] else 0)
+
+
+def doctor_self_test():
+    """負向測試：拿一份刻意壞掉的 MANIFEST 餵檢查器，它必須抓到。
+
+    只會綠不會紅的檢查等於沒有檢查——這個 exit code 講的是「測試過不過」，
+    不是那份 fixture 健不健康（fixture 當然不健康，那是重點）。
+    """
+    fixture = os.path.join(ROOT, "tools", "testdata", "doctor", "MANIFEST.tsv")
+    if not os.path.exists(fixture):
+        print(f"找不到 fixture：{fixture}", file=sys.stderr)
+        return 1
+    rows = doctor_manifest_rows(read_manifest(fixture))
+    for level, label, detail in rows:
+        print(f"  [{level}] {label}：{detail}")
+    caught = {l for l, _, _ in rows}
+    if "FAIL" in caught:
+        print("\n負向測試通過：檢查器在壞掉的 MANIFEST 上會紅。")
+        return 0
+    print("\n負向測試失敗：檢查器抓不到壞掉的 MANIFEST——它現在是恆真的。", file=sys.stderr)
+    return 1
+
+
+# ---------------------------------------------------------------- 接線安裝
+
+INSTALLED_ROOT_PATH = os.path.join(ROOT, "tools", "context", ".installed-root")
+BLOCK_BEGIN = "<!-- decision-stack:begin fragment={frag} sha256={sha} -->"
+BLOCK_END = "<!-- decision-stack:end -->"
+BLOCK_RE = re.compile(
+    r"<!-- decision-stack:begin fragment=(?P<frag>[^\s]+) sha256=(?P<sha>[0-9a-f]+) -->\n"
+    r"(?P<body>.*?)\n?" + re.escape(BLOCK_END) + r"\n?", re.DOTALL)
+
+
+def sha12(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()[:12]
+
+
+def enclosing_worktree(path):
+    """path 所在的 git 工作樹頂層，不在版控樹裡回 None。"""
+    d = os.path.dirname(os.path.abspath(path)) or "/"
+    try:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def backup(path):
+    dst = f"{path}.bak-{__import__('datetime').datetime.now().strftime('%Y%m%d%H%M')}"
+    with open(path, "rb") as src, open(dst, "wb") as out:
+        out.write(src.read())
+    return dst
+
+
+def plan_import(target, frag_rel, frag_abs):
+    """回傳 (動作, 新內容 or None, 說明)。不認識的區塊內容一律拒絕。"""
+    text = open(target, encoding="utf-8").read()
+    want_line = f"@{frag_abs}"
+    header = BLOCK_BEGIN.format(frag=frag_rel, sha=sha12(frag_abs))
+    block = f"{header}\n{want_line}\n{BLOCK_END}\n"
+    for m in BLOCK_RE.finditer(text):
+        if m.group("frag") != frag_rel:
+            continue
+        body = m.group("body").strip()
+        if body != want_line and not body.startswith("@"):
+            return "REFUSED", None, f"區塊內有不認識的內容：{body[:60]!r}"
+        if body == want_line and m.group("sha") == sha12(frag_abs):
+            return "OK", None, "已接好且 sha256 相符"
+        return "UPDATE", text[:m.start()] + block + text[m.end():], \
+               f"更新區塊（舊 sha={m.group('sha')}）"
+    if want_line in text:
+        return "REFUSED", None, "檔案裡已有裸的 @import 行但不在界定區塊內——請先手動移除"
+    sep = "" if text.endswith("\n") else "\n"
+    return "APPEND", text + sep + "\n" + block, "在檔尾新增區塊"
+
+
+def plan_instructions(target, frag_abs):
+    try:
+        data = json.loads(open(target, encoding="utf-8").read())
+    except json.JSONDecodeError as e:
+        return "REFUSED", None, f"目標不是合法 JSON：{e}"
+    items = data.get("instructions")
+    if items is None:
+        items = []
+    if not isinstance(items, list):
+        return "REFUSED", None, "instructions 不是陣列"
+    for it in items:
+        if isinstance(it, str) and os.path.realpath(os.path.expanduser(it)) == frag_abs:
+            return "OK", None, "instructions[] 已列到"
+    data["instructions"] = items + [frag_abs]
+    return "APPEND", json.dumps(data, ensure_ascii=False, indent=2) + "\n", \
+           f"append 進 instructions[]（原有 {len(items)} 筆）"
+
+
+SHIM_DIR = os.path.expanduser("~/.local/bin")
+SHIM_PATH = os.path.join(SHIM_DIR, "stack")
+
+
+def plan_shim(write):
+    """讓 `stack` 這個名字在 PATH 上解到本 repo 的 tools/stack。
+
+    這一步消掉一個參數。契約片段裡的檢索指令本來寫絕對路徑，那是每台機器都不同的值，
+    而片段是被各 harness 原樣載入的文字。有了 shim，片段寫 `stack recall` 就到處成立。
+
+    不搶名字。已指到別處時回 FAIL。
+    """
+    target = os.path.join(ROOT, "tools", "stack")
+    on_path = SHIM_DIR in os.environ.get("PATH", "").split(os.pathsep)
+    tail = "" if on_path else f"　{SHIM_DIR} 不在 PATH 上，請自己加"
+    if os.path.islink(SHIM_PATH) or os.path.exists(SHIM_PATH):
+        cur = os.path.realpath(SHIM_PATH)
+        if cur == os.path.realpath(target):
+            return ("OK", "stack shim", f"{SHIM_PATH} → 本 repo{tail}")
+        return ("FAIL", "stack shim", f"{SHIM_PATH} 已指向 {cur}。不搶這個名字，請自己決定")
+    if not write:
+        return ("PLAN", "stack shim", f"建 {SHIM_PATH} → {target}")
+    try:
+        os.makedirs(SHIM_DIR, exist_ok=True)
+        os.symlink(target, SHIM_PATH)
+    except OSError as e:
+        return ("FAIL", "stack shim", f"建不起來：{e}")
+    return ("DONE", "stack shim", f"{SHIM_PATH} → 本 repo{tail}")
+
+
+def cmd_install(args):
+    """依 MANIFEST 接線。寫入前拒絕任何位於其他 git 工作樹內的目標。
+
+    那道拒絕就是公私分界的機械閘門：結構上讓這支工具不可能把個人路徑寫進公司 repo
+    的指令檔（那些檔案未被 .gitignore 覆蓋，一次 git add . 就會被 commit 出去）。
+    """
+    top = (git_out("rev-parse", "--show-toplevel") or "").strip()
+    if os.path.realpath(top) != os.path.realpath(ROOT):
+        die(f"這棵樹的 git toplevel 是 {top}，而腳本位置推出來的 repo 是 {ROOT}。\n"
+            f"  兩者不同代表這是一份複製出來的樹，從這裡安裝會把接線指到錯的地方。\n"
+            f"  → 切到 {ROOT} 再跑 install")
+    manifest = read_manifest()
+    if not manifest:
+        die(f"讀不到 tools/context/MANIFEST.tsv，或它沒有任何一列。\n"
+            f"  install 靠這份清單決定要接哪些 harness。\n"
+            f"  → 確認 {os.path.join(ROOT, 'tools', 'context', 'MANIFEST.tsv')} 在且有內容")
+
+    if os.path.exists(INSTALLED_ROOT_PATH):
+        prev = open(INSTALLED_ROOT_PATH, encoding="utf-8").read().strip()
+        if prev and os.path.realpath(prev) != os.path.realpath(ROOT) and not args.relocate:
+            die(f"上次安裝的 repo 位置是 {prev}，現在是 {ROOT}。"
+                "\n  指標是絕對路徑，搬家會一次弄壞所有 harness："
+                "\n  → 確認要改指標請加 --relocate")
+
+    wanted = None if args.harness in (None, "all") else \
+        {h.strip() for h in args.harness.split(",") if h.strip()}
+    write = args.yes and not args.dry_run
+    if not write:
+        print("[dry-run] 只列計畫，不動任何檔案（要真的寫入請加 --yes）\n")
+
+    # 本機前置：hook 路徑與身分閘門。工具不代跑 ollama pull，也不 commit
+    steps = []
+    hooks_path = (git_out("config", "core.hooksPath") or "").strip()
+    if hooks_path != "tools/hooks":
+        if write:
+            git_out("config", "core.hooksPath", "tools/hooks")
+            steps.append(("DONE", "core.hooksPath", "設為 tools/hooks"))
+        else:
+            steps.append(("PLAN", "core.hooksPath", f"{hooks_path or '(未設)'} → tools/hooks"))
+    else:
+        steps.append(("OK", "core.hooksPath", "已是 tools/hooks"))
+    if not (git_out("config", "--local", "user.email") or "").strip():
+        steps.append(("FAIL", "commit 身分", "repo-local user.email 未設，pre-commit 的身分閘門"
+                                             "形同虛設　→ git config user.email <你的個人信箱>"))
+    try:
+        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
+        if any(m.get("name", "").split(":")[0] == EMBED_MODEL for m in tags.get("models", [])):
+            steps.append(("OK", "Ollama", f"{EMBED_MODEL} 在"))
+        else:
+            steps.append(("TODO", "Ollama", f"缺模型　→ 請自己跑：ollama pull {EMBED_MODEL}"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        steps.append(("TODO", "Ollama", f"連不上 {OLLAMA_URL}　→ ollama serve 後再跑 stack index"))
+    steps.append(plan_shim(write))
+    if not os.path.exists(INDEX_PATH):
+        steps.append(("TODO", "向量索引", "還沒建立　→ tools/stack index"))
+    else:
+        steps.append(("OK", "向量索引", "已存在"))
+
+    for level, label, detail in steps:
+        print(f"  [{level}] {label}：{detail}")
+    print()
+
+    # 逐列接線
+    results = []
+    for r in manifest:
+        harness, primitive = r.get("harness", "?"), r.get("primitive", "")
+        frag_rel = r.get("fragment", "")
+        label = f"{harness}／{os.path.basename(frag_rel) or '-'}"
+        if wanted is not None and harness not in wanted:
+            results.append(("SKIP", label, "不在 --harness 指定範圍內"))
+            continue
+        if primitive == "unwired":
+            results.append(("UNWIRED", label, r.get("note") or "宣告的缺口，不接"))
+            continue
+        if primitive == "inherit":
+            results.append(("OK", label, f"繼承自 {r.get('target_path')}，沒有獨立接線點"))
+            continue
+        frag_abs = os.path.realpath(os.path.join(ROOT, frag_rel))
+        if not frag_abs.startswith(os.path.realpath(ROOT) + os.sep) or not os.path.exists(frag_abs):
+            results.append(("REFUSED", label, f"片段不在 repo 內或不存在：{frag_rel}"))
+            continue
+        target = os.path.expanduser(r.get("target_path", ""))
+        if not os.path.exists(target):
+            results.append(("SKIP", label, f"目標不存在（這台機器沒裝這個 harness）："
+                                           f"{r.get('target_path')}"))
+            continue
+        if os.path.realpath(target) == os.path.realpath(
+                os.path.join(CLAUDE_DIR, "settings.json")):
+            results.append(("REFUSED", label, "不碰 ~/.claude/settings.json（含明文金鑰）"))
+            continue
+        wt = enclosing_worktree(target)
+        if wt and os.path.realpath(wt) != os.path.realpath(ROOT):
+            results.append(("REFUSED", label, f"{r.get('target_path')} 位於版控樹 {wt}，"
+                                              "寫入會讓個人路徑變成可 commit 的內容"))
+            continue
+        if primitive == "import":
+            action, new_text, why = plan_import(target, frag_rel, frag_abs)
+        elif primitive == "instructions[]":
+            action, new_text, why = plan_instructions(target, frag_abs)
+        else:
+            action, new_text, why = "REFUSED", None, f"不認識的原語 {primitive}"
+        if action in ("OK", "REFUSED") or new_text is None:
+            results.append((action, label, why))
+            continue
+        if not write:
+            results.append(("PLAN", label, f"{why}（{r.get('target_path')}）"))
+            continue
+        bak = backup(target)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        results.append(("DONE", label, f"{why}；備份 {os.path.basename(bak)}"))
+
+    for level, label, detail in results:
+        mark = {"DONE": "✓", "OK": "✓", "PLAN": "·", "SKIP": "—",
+                "UNWIRED": "—", "REFUSED": "✗"}.get(level, "?")
+        print(f"  {mark} [{level}] {label}：{detail}")
+
+    if write:
+        with open(INSTALLED_ROOT_PATH, "w", encoding="utf-8") as f:
+            f.write(os.path.realpath(ROOT) + "\n")
+
+    refused = sum(1 for l, _, _ in results if l == "REFUSED")
+    print(f"\n接線安裝：{sum(1 for l,_,_ in results if l == 'DONE')} 寫入 ／ "
+          f"{sum(1 for l,_,_ in results if l in ('OK',))} 已就位 ／ "
+          f"{sum(1 for l,_,_ in results if l in ('PLAN',))} 待寫入 ／ "
+          f"{sum(1 for l,_,_ in results if l in ('SKIP',))} 跳過 ／ {refused} 拒絕")
+    if not write:
+        print("（dry-run 不驗證接線；真的寫入後會自動接著跑 doctor）")
+        return 1 if refused else 0
+    print("\n--- doctor ---")
+    return cmd_doctor(argparse.Namespace(quiet=False, json=False, self_test=False))
+
+
+def die(msg):
+    print(f"stack: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="stack", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("recall", help="語意檢索 top-k ＋ 一跳連結鄰居")
+    r.add_argument("query")
+    r.add_argument("-k", type=int, default=5)
+    r.add_argument("-q", "--quiet", action="store_true", help="不印重嵌訊息")
+    r.add_argument("--no-branches", action="store_true",
+                   help="只掃工作目錄，不掃未合併分支（預設會掃）")
+    r.add_argument("--stale-ok", action="store_true",
+                   help="唯讀：用既有索引比對、不重嵌不寫檔；過期與全新條目明列（計畫模式用）")
+    r.set_defaults(func=cmd_recall)
+
+    s = sub.add_parser("shape", help="全量 cluster：收斂候選與拆分候選")
+    s.add_argument("--threshold", type=float, default=0.70, help="同群門檻（預設 0.70）")
+    s.add_argument("--pairs", type=int, default=15, help="列出最相似的幾對（預設 15）")
+    s.add_argument("--split", type=int, default=12, help="列出凝聚度最低的幾筆（預設 12）")
+    s.set_defaults(func=cmd_shape)
+
+    l = sub.add_parser("lint", help="索引↔檔案、連結、frontmatter、upstream、詞彙表、索引過期")
+    l.add_argument("--strict", action="store_true",
+                   help="寫作契約 v2 的三項（首句一句一意／固定分節／related 具名）從提醒升為缺陷")
+    l.add_argument("--shippable", action="store_true",
+                   help="只掃可升級區：日期、PR 號、版本號、單機用語、第一人稱、連進三層、具名清單")
+    l.set_defaults(func=cmd_lint)
+
+    t = sub.add_parser("tree", help="依 upstream 印格狀結構——瀏覽視角；查找走 recall")
+    t.set_defaults(func=cmd_tree)
+
+    u = sub.add_parser("usage", help="使用記錄報表：命中統計與淘汰候選（下界訊號）")
+    u.add_argument("--window", type=int, default=90, help="淘汰觀察窗天數（預設 90）")
+    u.add_argument("--queries", action="store_true",
+                   help="改看查詢側：這一輪問了什麼、同一句問了幾遍")
+    u.set_defaults(func=cmd_usage)
+
+    ev = sub.add_parser("eval", help="召回率回歸（tools/regression.tsv）")
+    ev.add_argument("-k", type=int, default=5, help="次要門檻（預設 top-5）")
+    ev.add_argument("--save-baseline", action="store_true", help="把這次結果存成基線（不進版控）")
+    ev.set_defaults(func=cmd_eval)
+
+    d = sub.add_parser("doctor", help="接線體檢：規則有沒有真的到得了各 harness（唯讀）")
+    d.add_argument("-q", "--quiet", action="store_true", help="只印非 OK 的列")
+    d.add_argument("--json", action="store_true", help="機器可讀輸出（給 selfcheck 用）")
+    d.add_argument("--self-test", action="store_true",
+                   help="負向測試：拿刻意壞掉的 MANIFEST 餵檢查器，它必須抓到")
+    d.set_defaults(func=cmd_doctor)
+
+    ins = sub.add_parser("install", help="依 MANIFEST 接線（拒絕寫入任何版控樹內的目標）")
+    ins.add_argument("--harness", help="逗號分隔，或 all（預設 all）")
+    ins.add_argument("--dry-run", action="store_true", help="只列計畫")
+    ins.add_argument("--yes", action="store_true", help="真的寫入（沒有這個旗標等同 dry-run）")
+    ins.add_argument("--relocate", action="store_true",
+                     help="repo 換過位置，明示要改掉所有指標")
+    ins.set_defaults(func=cmd_install)
+
+    ini = sub.add_parser("init", help="建立一個新的決策棧。已存在的檔案不覆蓋")
+    ini.set_defaults(func=cmd_init)
+
+    i = sub.add_parser("index", help="強制重建向量索引")
+    i.set_defaults(func=cmd_index)
+
+    rt = sub.add_parser("root", help="印 repo root。給腳本與契約片段用，取代寫死路徑")
+    rt.set_defaults(func=cmd_root)
+
+    pr = sub.add_parser("prose", help="量一段文字的句子形狀，可以是 repo 之外的檔案")
+    pr.add_argument("file", help="要量的檔案")
+    pr.set_defaults(func=cmd_prose)
+
+    tr = sub.add_parser("trace", help="查一份計畫或提案裡的留痕行是哪一次檢索留下的")
+    tr.add_argument("file", help="要查的檔案，可以在 repo 之外")
+    tr.set_defaults(func=cmd_trace)
+
+    cf = sub.add_parser("config", help="印本機設定值。查不到回 1")
+    cf.add_argument("key", help="點號分隔，例：mem0.scope")
+    cf.set_defaults(func=cmd_config)
+
+    up = sub.add_parser("upgrade", help="把 template 的可升級區拉進一條分支。條目不碰")
+    up.add_argument("--remote", default="template", help="template 的 remote 名")
+    up.add_argument("--branch", default="main", help="template 的分支")
+    up.add_argument("--yes", action="store_true", help="真的開分支並取出；沒有它只列計畫")
+    up.set_defaults(func=cmd_upgrade)
+
+    co = sub.add_parser("contribute", help="把可升級區的改動送回 template。私有區一律拒絕")
+    co.add_argument("paths", nargs="+", help="要送回去的檔案，repo 相對路徑")
+    co.add_argument("--remote", default="template")
+    co.add_argument("--branch", default="main")
+    co.add_argument("--topic", help="分支主題，用在 contrib/<主題>")
+    co.set_defaults(func=cmd_contribute)
+
+    args = p.parse_args()
+    # init 要建的正是 assert_repo_root 要找的目錄，所以它在檢查之前跑
+    if getattr(args, "func", None) is not cmd_init:
+        assert_repo_root()
+        # 正常時完全不印。一份天天報錯的檢查會被停止閱讀，然後真正的訊號會跟著
+        # 一起被略過——這是 guard-must-cover-every-writer 的直接要求。
+        if getattr(args, "cmd", None) in DRIFT_WATCHED:
+            for m in baseline_drift():
+                print(f"⚠ 基準飄移：{m}", file=sys.stderr)
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

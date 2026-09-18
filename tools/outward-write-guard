@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""外發前的檢查點：提醒「動作成形的那一刻要再檢索一次」。
+
+掛在 PreToolUse，matcher 涵蓋會產生對外產出的工具（票卡留言、公窗訊息）。
+讀 tools/.last-recall，若最近一次 recall 已逾時就注入一行提醒並記一筆。
+
+**第一版只提醒、不阻擋。** 依五步法，自動化放最後：先量「外發前沒檢索」實際發生幾次，
+非零才考慮改成 deny。改 deny 之前必須逐條確認排程 routine 各自的檢索步驟，
+否則會在無人值守時卡住。
+
+**刻意不做的判斷：不去分類查詢句是主題句還是動作句。** 用正則猜句型會生出一個沒有依據的
+訊號，那比沒有訊號糟——見 Decisions/an-unactionable-metric-is-noise.md。這裡只查一件
+量得準的事：距離最近一次 recall 多久。句型的判斷留給人，契約寫在 tools/context/usage-contract.md。
+"""
+import datetime
+import json
+import os
+import sys
+
+STALE_MINUTES = 30
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LAST_RECALL = os.path.join(ROOT, "tools", ".last-recall")
+GUARD_LOG = os.path.join(ROOT, "tools", ".guard.tsv")
+
+
+def minutes_since_last_recall():
+    """回傳距上次 recall 的分鐘數；沒有紀錄或讀不懂時回 None（視同從未檢索）。"""
+    try:
+        with open(LAST_RECALL, encoding="utf-8") as f:
+            stamp = f.readline().split("\t")[0].strip()
+        delta = datetime.datetime.now() - datetime.datetime.fromisoformat(stamp)
+        return delta.total_seconds() / 60
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+# 工具名單獨看不出是不是外發的，在這裡用 tool_input 補判。
+# 只列「名字會被粗網撈到、但該次呼叫其實不外發」的例外——這份名單長不起來才是對的：
+# 精確度集中在這裡一處，matcher 只當粗網。散回 matcher 去逐一列舉工具名，就是
+# Decisions/guard-must-cover-every-writer.md 講的那種會再漂移一次的做法。
+def is_outward(tool, tool_input):
+    """這次呼叫會不會產生別人讀得到的文字。"""
+    if tool == "Artifact":
+        # 同一個工具名混了讀與發布，只有這幾個 action 會外發
+        return (tool_input.get("action") or "publish") in ("publish", "reply")
+    if tool.endswith(("label_message", "label_thread")):
+        return False  # 貼標是狀態異動，不是外發文字
+    return True
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
+    tool = payload.get("tool_name", "?")
+    tool_input = payload.get("tool_input") or {}
+
+    if not is_outward(tool, tool_input):
+        return 0
+
+    age = minutes_since_last_recall()
+    if age is not None and age <= STALE_MINUTES:
+        return 0
+
+    # 記一筆，供一個月後判斷要不要升級成 deny
+    try:
+        with open(GUARD_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}\t"
+                    f"{tool}\t{'never' if age is None else round(age)}\n")
+    except OSError:
+        pass
+
+    since = "從未檢索" if age is None else f"距上次檢索 {round(age)} 分鐘"
+    print(
+        f"[決策棧] 正要用 {tool} 送出對外產出，但{since}（門檻 {STALE_MINUTES} 分）。\n"
+        f"  動作成形的那一刻要再檢索一次，查詢句用「我正要做的那個動作」造：\n"
+        f"  stack recall \"正要寫這則留言，該寫什麼、寫多長\"\n"
+        f"  契約見 tools/context/usage-contract.md。這是提醒，不阻擋。",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

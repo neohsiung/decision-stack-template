@@ -1,0 +1,4 @@
+harness	target_path	primitive	fragment	note
+broken-fragment	~/.claude/CLAUDE.md	import	tools/context/does-not-exist.md	-
+broken-target	~/nope/nowhere.json	instructions[]	tools/context/usage-contract.md	-
+escaping-fragment	~/.claude/CLAUDE.md	import	../../../etc/hosts	-

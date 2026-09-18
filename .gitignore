@@ -1,0 +1,12 @@
+# Python 執行時產物。tools/stack 是單檔腳本，import 它才會生 bytecode，
+# 但 stack doctor 的 self-test 會 import，所以這個目錄一定會出現。
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Pending/ 是待議暫存，stack init 會建它。.gitkeep 只是佔位，不進版控。
+# 只忽略 .gitkeep，不忽略整個目錄：Pending/ 裡真的有待議條目時要在 git status
+# 看得到，write-procedure 要求下一個互動 session 先清它再做別的寫入。
+Pending/.gitkeep

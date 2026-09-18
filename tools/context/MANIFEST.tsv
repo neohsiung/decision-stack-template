@@ -1,0 +1,16 @@
+harness	target_path	primitive	fragment	note
+claude	~/.claude/CLAUDE.md	import	tools/context/usage-contract.md	-
+claude	~/.claude/CLAUDE.md	import	tools/context/write-procedure.md	-
+claude	~/.claude/CLAUDE.md	import	tools/context/source-marking.md	-
+subagent	~/.claude/CLAUDE.md	inherit	tools/context/usage-contract.md	-
+subagent	~/.claude/CLAUDE.md	inherit	tools/context/write-procedure.md	-
+subagent	~/.claude/CLAUDE.md	inherit	tools/context/source-marking.md	-
+opencode	~/.config/opencode/opencode.json	instructions[]	tools/context/usage-contract.md	-
+opencode	~/.config/opencode/opencode.json	instructions[]	tools/context/write-procedure.md	-
+opencode	~/.config/opencode/opencode.json	instructions[]	tools/context/source-marking.md	-
+kilo	~/.config/kilo/kilo.json	instructions[]	tools/context/usage-contract.md	-
+kilo	~/.config/kilo/kilo.json	instructions[]	tools/context/write-procedure.md	-
+kilo	~/.config/kilo/kilo.json	instructions[]	tools/context/source-marking.md	-
+gemini	~/.gemini/GEMINI.md	import	tools/context/usage-contract.md	-
+cursor	-	unwired	-	declared:no-user-level-file-channel
+explore	-	unwired	-	declared:builtin-agent-type-no-definition-file

@@ -1,0 +1,12 @@
+# 本機設定。複製成 tools/stack.config.toml 再填。那一份不進版控。
+# 整節留空或檔案不存在，代表本機沒有該項功能，相關契約段落自動不適用。
+
+# mem0 鏡射：只有 origin: judgment_case 會寫。沒設就是不用 mem0。
+# [mem0.scope]
+# workspace = "<你的 mem0 workspace>"
+# project   = "<你的 mem0 project>"
+
+# 個人 GitHub 帳號。gh 的作用中帳號可能是別的。
+# 工具用 GH_TOKEN=$(gh auth token --user <這個值>) 取權杖，不切全域帳號。
+# [github]
+# account = "<你的 GitHub 帳號>"

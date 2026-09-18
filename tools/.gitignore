@@ -1,0 +1,16 @@
+# 向量索引是純衍生物——從 .md 隨時可重建，進版控只會 churn 掉 git history。
+# 換機器：ollama pull bge-m3 && tools/stack index
+.index.json
+.index-branches.json
+.usage.tsv
+.last-recall
+.guard.tsv
+context/.installed-root
+
+# 本機區。裝只對這一台、這一個人成立的東西：驗證日期、接線筆記、事故證據、具名清單。
+# 範本在 local.example/，那份進版控。
+local/
+.eval-baseline.json
+
+# 本機設定，含個人識別。範本 stack.config.toml.example 進版控。
+stack.config.toml
