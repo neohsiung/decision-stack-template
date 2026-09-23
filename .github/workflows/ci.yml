@@ -14,6 +14,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      # lint 在還沒初始化的 clone 上回 2 並要人先跑 init。CI 拿到的正是那個狀態，
+      # 所以這一步不能省，省掉三項全部停在第一步。init 建出來的目錄不進版控。
+      - name: init
+        run: tools/stack init
+
       # 三項都不需要網路與嵌入模型：純檔案與 git 檢查
       - name: lint
         run: tools/stack lint
