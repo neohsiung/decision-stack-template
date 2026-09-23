@@ -43,21 +43,11 @@
 
 ## 怎麼裝
 
-```bash
-git clone <remote> <你選的位置>        # 位置隨你，工具從自身位置推導 repo root
-cd <你選的位置>
-ollama pull bge-m3                     # 嵌入模型
-tools/stack install --yes              # 接線、建 PATH 上的 stack shim、設 hooksPath
-tools/stack index                      # 建向量索引，純衍生物，不進版控
-cp -r tools/local.example tools/local  # 本機區，填 verified 與筆記
-```
+安裝程序的正本在 repo 根目錄的 `README.md` §快速開始，這裡不重寫一份。兩份各自演化的步驟表
+會分岔，而分岔沒有訊號。
 
-接線的兩個命令：
-
-```bash
-stack install          # 預設 dry-run 只列計畫。加 --yes 才寫入
-stack doctor           # 體檢接線是否還活著。唯讀，含死接線對帳
-```
+這一節只補片段這一側的事：`stack install` 會把下面那些 `@import` 行寫進各 harness 的設定檔，
+`stack doctor` 檢查它們還在不在。
 
 ## 硬規則
 
