@@ -38,10 +38,15 @@
 
 ```bash
 git clone <這個 repo> my-stack && cd my-stack
-tools/stack init            # 建目錄與索引。已存在的檔案一律不覆蓋
-tools/stack install --yes   # 接線、建 shim、設 hooksPath
-stack doctor                # 看接線與缺什麼
+ollama pull bge-m3                     # 嵌入模型，recall 要用
+tools/stack init                       # 建目錄與索引。已存在的檔案一律不覆蓋
+tools/stack install --yes              # 接線、建 PATH 上的 stack shim、設 hooksPath
+cp -r tools/local.example tools/local  # 本機區。沒有它 doctor 每一列都停在「還沒驗過」
+tools/stack index                      # 建向量索引。純衍生物，不進版控
+stack doctor                           # 看接線與缺什麼
 ```
+
+`install` 預設是 dry-run 只列計畫，加 `--yes` 才寫入。`doctor` 唯讀，含死接線對帳。
 
 `init` 之後棧是空的，而空的棧寫不出第一筆。寫入程序要求新原則掛上游，這時還沒有上游可掛。
 `skills/decision-stack-bootstrap/` 帶你從既有素材反向萃取出最小自洽集合。
@@ -57,6 +62,7 @@ stack recall "<一段話>"   # 語意檢索，top-k 加一跳連結鄰居
 stack lint                # 分節、連結、索引涵蓋、推導鏈方向
 stack lint --shippable    # 去識別化：這句話換一台機器、換一個人還成立嗎
 stack eval                # 對你自己寫的題目跑檢索回歸，跟基線對照
+                          # 要先 cp tools/regression.tsv.example tools/regression.tsv
 stack usage               # 哪些條目從來沒被任何情境需要
 stack prose <檔案>        # 量任意一段文字的句子形狀，對照棧內條目
 stack tree                # 推導鏈的格狀結構與孤兒
@@ -66,7 +72,9 @@ stack tree                # 推導鏈的格狀結構與孤兒
 
 - **推導鏈的完整性。** 孤兒與方向錯誤由 `lint` 與 `tree` 列出來。
 - **去識別化。** `lint --shippable` 跑在會被複製出去的那一區，pre-commit 每次 commit 都跑它。
-- **檢索品質。** 改一批條目之後 `eval` 跟基線對照，退步會出現在對照行裡。
+- **檢索品質。** 寫好 `tools/regression.tsv`（範例檔在 `tools/regression.tsv.example`）之後，
+  改一批條目再跑 `eval` 跟基線對照，退步會出現在對照行裡。**語料不在的時候 `eval` 直接跳過，
+  不會有任何檢查發生**，所以這一項要你先寫題目才成立。
 - **淘汰。** `usage` 只報缺席，不自動刪。缺席要累積夠久才算訊號。
 
 ## 這個 repo 沒有內容
