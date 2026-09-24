@@ -110,6 +110,44 @@ SECTIONS = {
     "Decisions": ["規則", "事件", "為什麼", "怎麼用"],
     EXPRESSIONS: ["適用的格子", "規格", "骨架", "不用它的情況"],
 }
+# 新 Decision 一律經 Framework 的生效閘門。判準是條目的 recorded 值。
+#
+# 界線由這座棧自己的 curation 狀態給，不寫死在工具裡：一座剛建的棧沒有遺留條目，界線留空就是全部都要過閘門；
+# 一座已經在用的棧要指定它收緊的那一天，讓收緊之前的條目留給 curation 逐步補。
+# 寫死在這裡等於把某一座棧的日曆套到所有複製這份工具的棧上。
+#
+# 界線寫在 tools/curation.toml 的 [gate] framework_from，那一份進版控。
+#
+# 不設豁免欄位。說不出骨架時走寫入程序 step 3 的三種合法結果，不要替它填一個理由。
+# 豁免欄位會把「說不出骨架」壓成一種例外分類，之後沒有人分得出是哪一種。
+def read_curation():
+    """這座棧的 curation 狀態。進版控，不發布。檔不在回空 dict。
+
+    跟 read_config 分開的理由：那一份是機器本機設定，換機器就換一份，所以不進版控。
+    這一份記的是這座棧的歷史，CI 的乾淨 checkout 也要讀得到，所以必須進版控。
+    第一版把界線放進 read_config，CI 因此讀成空字串、對全部條目開閘門，紅在既有條目上。
+    """
+    if not os.path.exists(CURATION_PATH):
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            with open(CURATION_PATH, encoding="utf-8") as f:
+                return parse_toml_subset(f.read())
+        except OSError:
+            return {}
+    try:
+        with open(CURATION_PATH, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def framework_gate_from():
+    return str(read_curation().get("gate", {}).get("framework_from", "") or "")
+
+
 # 首句規則句不得含的接續記號：一句只講一個意思
 RULE_FORBIDDEN = ("——", "；", "：")
 # 密度警訊門檻。超過只提醒，不擋。
@@ -119,6 +157,7 @@ RULE_FORBIDDEN = ("——", "；", "：")
 # 引號密度刻意不設門檻：校準組裡改得最乾淨的那一筆引號密度最高，它不是品質訊號。
 DENSITY_MID_DASH_PER_K = 2.5
 DENSITY_AVG_SENTENCE = 55
+CURATION_PATH = os.path.join(ROOT, "tools", "curation.toml")
 INDEX_PATH = os.path.join(ROOT, "tools", ".index.json")
 BRANCH_INDEX_PATH = os.path.join(ROOT, "tools", ".index-branches.json")
 MEMORY_PATH = os.path.join(ROOT, "MEMORY.md")
@@ -1571,6 +1610,7 @@ def cmd_lint(args):
     # 4. 上行格狀結構：方向嚴格向上、目標存在。覆蓋率是缺口報告不是錯誤——
     #    目標形狀是每筆 Decision 有 Framework/Model、每筆 Framework 有 Model，逐輪收斂補齊。
     rank = {"Models": 0, "Frameworks": 1, "Decisions": 2}
+    gate_from = framework_gate_from()
     for e in entries:
         for u in e["upstream"]:
             if u not in live:
@@ -1587,6 +1627,12 @@ def cmd_lint(args):
                 problems.append(f"{e['relpath']}：upstream {u} 不是更上游的層（方向必須嚴格向上）")
         if e["layer"] == "Models" and e["upstream"]:
             problems.append(f"{e['relpath']}：Models 條目不設 upstream（它就是最上游）")
+        # 新 Decision 一律經 Framework。生效日見 FRAMEWORK_GATE_FROM 的註解。
+        if (e["layer"] == "Decisions"
+                and str(e["fm"].get("recorded", "")) >= gate_from
+                and not any(u.startswith("Frameworks/") for u in e["upstream"])):
+            problems.append(f"{e['relpath']}：新 Decision 要經 Framework，只掛 Model 不合規。"
+                            f"答不出骨架時走寫入程序 step 3：攤開候選討論，或寫進 Pending/")
 
     # 5. 詞彙表雙向一致。單向的索引會靜默漂移——正是 source-migration-downstream-drift
     #    那種失效，所以兩個方向都機械比對：用了沒列 → 補「棧內引用」；列了沒用 → 清單過期。
@@ -1649,6 +1695,13 @@ def cmd_lint(args):
         print(f"upstream 覆蓋：{layer} {len(have)}/{len(pool)}"
               + (f"　缺口：{', '.join(orphans[:6])}" + ("…" if len(orphans) > 6 else "")
                  if orphans else "　（全連）"))
+    # 完全沒有 upstream 與「有 upstream 但只到 Model」是兩件事，分開報。
+    # 前者沒有基準，後者有基準但少了中間層。兩者的下一步動作不同。
+    no_fw = [e["stem"] for e in entries if e["layer"] == "Decisions"
+             and e["upstream"] and not any(u.startswith("Frameworks/") for u in e["upstream"])]
+    if no_fw:
+        print(f"直掛 Model（有基準但沒有骨架）：{len(no_fw)} 筆　"
+              + ", ".join(no_fw[:6]) + ("…" if len(no_fw) > 6 else ""))
 
     if notices:
         print()
@@ -1746,16 +1799,50 @@ def cmd_eval(args):
 CONFIG_PATH = os.path.join(ROOT, "tools", "stack.config.toml")
 
 
+def parse_toml_subset(text):
+    """解析這份設定用到的 TOML 子集：[a.b] 節頭加 key = "value"。
+
+    只為了 tomllib 不在的直譯器存在，見 read_config。設定檔的形狀由 .example 固定，
+    超出這個子集的寫法會被忽略而不是猜。
+    """
+    out, cur = {}, None
+    for raw in text.split("\n"):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur = out
+            for part in line[1:-1].split("."):
+                cur = cur.setdefault(part.strip(), {})
+            continue
+        if "=" in line and cur is not None:
+            k, _, v = line.partition("=")
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                cur[k.strip()] = v[1:-1]
+    return out
+
+
 def read_config():
     """本機設定。檔不在回空 dict，這不是錯誤。
 
     住在 tools/，跟 .index.json、local/ 同一類：本機狀態，被 tools/.gitignore 蓋住，
     升級覆蓋可升級區時不會衝突。
+
+    tomllib 是 3.11 才進標準函式庫。舊直譯器上原本直接回空 dict，而呼叫端把空 dict 讀成
+    「本機沒有設定這項」——設定明明填了卻被當成沒填，而且不產生訊號。改成退到子集解析器：
+    檔案真的不在才回空。
     """
+    if not os.path.exists(CONFIG_PATH):
+        return {}
     try:
         import tomllib
     except ImportError:
-        return {}
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                return parse_toml_subset(f.read())
+        except OSError:
+            return {}
     try:
         with open(CONFIG_PATH, "rb") as f:
             return tomllib.load(f)
@@ -1918,7 +2005,7 @@ UPGRADABLE_GLOBS = [
 ]
 # 永遠不跨界的東西。列出來是為了讓「為什麼不是可升級區」看得見，不是給程式判斷用的。
 PRIVATE_NOTE = ("Models/、Frameworks/、Decisions/、Expressions/、Pending/ 的條目，"
-                "MEMORY.md、GLOSSARY.md、tools/local/、tools/stack.config.toml、"
+                "MEMORY.md、GLOSSARY.md、tools/local/、tools/stack.config.toml、tools/curation.toml、"
                 "tools/regression.tsv")
 
 
