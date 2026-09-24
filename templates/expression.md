@@ -5,7 +5,7 @@ type: expression
 origin: <judgment_case | code_review | self_caught | elicited | external_reference | repo_sync>
 recorded: <入棧當天，YYYY-MM-DD。不回填>
 audience_direction: <對上 | 水平 | 對下>
-audience_role: <決定者 | 執行者 | 被諮詢者 | 被知會者>
+audience_role: <決定者 | 執行者 | 被諮詢者 | 被知會者 | 轉傳者>
 channel: <即時訊息 | 電子郵件 | 票卡留言 | 溝通文件 | 簡報>
 upstream: <選用。這一格的寫法依據哪條判斷，指進 Models/、Frameworks/ 或 Decisions/>
 downstream: <選用。棧外那份被執行的正本的路徑>

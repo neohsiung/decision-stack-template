@@ -23,8 +23,11 @@
    它在哪一格，檢索走 `description`，所以那一行要寫出這一格的情境。棧外已經
    有一份被執行的模板時，骨架節不抄全文，寫路徑加差異，理由見 SPEC §內容分層。三層的追問是：
    - 新 Decision 問兩題：這條判斷走的是哪副骨架？那副骨架背後是哪個信念？兩題都要有答案。
-     新 Decision 一律經 Framework，直掛 Model 不合規。既存直掛 Model 的條目留給 curation
-     逐步補，不追溯判違規。
+     新 Decision 一律經 Framework，直掛 Model 不合規。這一條由 `stack lint` 判缺陷，判準是
+     條目的 `recorded:` 值跟 `tools/curation.toml` 的 `[gate] framework_from` 比。界線之前的
+     條目留給 curation 逐步補，不追溯判違規；它們列在 lint 的「直掛 Model」那一行，
+     那是下一輪的輸入不是缺陷。
+     **沒有豁免欄位。** 說不出骨架時走下面的三種合法結果，不要替它填一個理由。
    - 新 Framework 問一題：它由哪個信念長出來？
 
    答案到位才建檔。答案可以是既有條目，或本輪一併建立的上游。這是閘門，不是提醒。答不出時：
