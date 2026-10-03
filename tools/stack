@@ -644,7 +644,10 @@ def github_anchor(heading):
 
 
 def glossary_sections():
-    """回傳 {anchor: {"term", "backrefs"}}。backrefs 取自各節的「棧內引用」行。"""
+    """回傳 {anchor: {"term", "backrefs"}}。backrefs 取自各節的「棧內引用」行。
+
+    術語是 ### 不是 ##。詞彙表分成外部術語與棧內術語兩節，那兩個 ## 是分節不是術語。
+    """
     if not os.path.exists(GLOSSARY_PATH):
         return {}
     sections, current = {}, None
@@ -654,7 +657,7 @@ def glossary_sections():
     # 不跳過的話它會變成一個沒有反向引用的幽靈術語，而空棧第一次 lint 就紅
     for line in re.sub(r"<!--.*?-->", "", text, flags=re.S).splitlines(True):
         if True:
-            m = re.match(r"^## (.+)$", line)
+            m = re.match(r"^### (.+)$", line)
             if m:
                 current = github_anchor(m.group(1))
                 sections[current] = {"term": m.group(1).strip(), "backrefs": []}
@@ -667,7 +670,11 @@ def glossary_sections():
 def glossary_usages():
     """全 repo 指向 GLOSSARY.md#錨點 的連結：{anchor: set(repo 相對路徑)}。"""
     usages = {}
-    files = [("README.md", os.path.join(ROOT, "README.md"))]
+    # 規則文件自己也要在掃描範圍裡。訂規則的那幾份寫在規則成文之前或當下，之後的增補
+    # 又會繼承周圍的舊寫法，而沒有任何機制會把規則回頭套在寫下它的那份文件上，除非
+    # 掃描範圍明文包含它。
+    files = [(f, os.path.join(ROOT, f)) for f in
+             ("README.md", "README.en.md", "SPEC.md", "WRITING.md", "CONTRIBUTING.md")]
     # tools/context/ 的片段是保證載入通道的正本，判準會從 README 搬進去，
     # 所以詞彙表的雙向檢查要看得到它——看不到的那一側會靜默漂移。
     ctx = os.path.join(ROOT, "tools", "context")
@@ -1881,22 +1888,56 @@ MEMORY_SKELETON = """# 決策棧索引
 ## Expressions — 用詞、語氣與內容取捨：這一格該怎麼寫
 """
 
+# 術語是 ###，## 是分節。glossary_sections 只認 ###，範例寫成 ## 的話，照著寫的第一個術語
+# 不會被認到，lint 會對每個連過去的檔報「沒有錨點」。
+# 棧內術語節預先放 SPEC 自己連到的三個詞：SPEC 在可升級區、詞彙表不在，少了它們，
+# 剛 init 的棧第一次 lint 就紅。
 GLOSSARY_SKELETON = """# 詞彙表
 
-外部具名術語的全名、定義與原始定義出處集中在這裡。條目內文照用縮寫，讀者不用離站查找。
+這份表管兩種詞，各有各的收詞判準。**雙向索引**對兩節一樣：條目內文首次出現術語時連到本表
+錨點，本表每個術語列回引用它的檔案，兩邊的一致性由 `stack lint` 機械檢查，不靠自律。
+術語用 `###`，`##` 是分節。
 
-**收詞判準**：外部具名框架、方法論、非日常縮寫才收。日常工程詞（API、CLI、PR）不收。
-**雙向索引**：條目內文首次出現術語時連到本表錨點，本表每個術語列回引用它的檔案。
-兩邊的一致性由 `stack lint` 機械檢查，不靠自律。術語依字母序排列。
+## 外部術語
+
+**收的是什麼**：外部具名框架、方法論、非日常縮寫。日常工程詞（API、CLI、PR）不收。
+每一筆都要有原始定義的出處連結。依字母序排列。
 
 <!-- 格式範例，用到第一個術語時照這個形狀寫，然後刪掉這段註解：
 
-## bus factor
+### bus factor
 
 一個專案失去幾位關鍵成員就會停擺的人數。數字越小，知識集中度越高、風險越大。
 出處：[Bus factor — Wikipedia](https://en.wikipedia.org/wiki/Bus_factor)
 棧內引用：[某條目](<層資料夾>/<檔名>.md)
 -->
+
+## 棧內術語
+
+**收的是什麼**：這座棧自己在用、而且同一個詞已經出現過兩種以上意思的詞。外部術語有站外出處
+可以指，這些沒有，所以每一筆要指定定義住在哪裡。
+
+### 骨架
+
+`Frameworks/` 這一層的內容：思考與作業的骨架，回答怎麼下判斷。量詞是「副」。
+Expression 條目的 `## 骨架` 分節是另一個東西，裝的是綁死一格產出、可以整段照抄的文字。
+講「一副骨架」指這一層，講「骨架節」指那個分節。
+定義住在：[SPEC §各層契約](SPEC.md)
+棧內引用：[SPEC §各層契約](SPEC.md)
+
+### 軸
+
+一組東西沿著它變化的那個方向。拆一件事時先問它沿哪些軸變化，每條軸各問一次，不合併成一題。
+這座棧講「軸」不講「維度」。
+定義住在：[SPEC §Expressions 的軸](SPEC.md)
+棧內引用：[SPEC §Expressions 的軸](SPEC.md)
+
+### 格
+
+兩個意思，靠後面那個名詞分。Expressions 的「格子」是三軸交叉出來的那一格：一個方向、
+一個權責、一個渠道。「一格值」是紀錄裡的一個欄位。寫的時候把名詞帶上。
+定義住在：[SPEC §Expressions 的軸](SPEC.md)
+棧內引用：[SPEC §Expressions 的軸](SPEC.md)
 """
 
 
