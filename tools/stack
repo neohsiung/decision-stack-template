@@ -1931,6 +1931,16 @@ def cmd_init(args):
     ensure_file("MEMORY.md", MEMORY_SKELETON)
     ensure_file("GLOSSARY.md", GLOSSARY_SKELETON)
 
+    # 個人檔案：骨架在 templates/，實檔建在根目錄與 Profile/，不在可升級區。見 SPEC §個人檔案
+    agents_tpl = os.path.join(ROOT, "templates", "agents.md")
+    if os.path.exists(agents_tpl):
+        ensure_file("AGENTS.md", open(agents_tpl, encoding="utf-8").read())
+    profile_tpl = os.path.join(ROOT, "templates", "profile.md")
+    if os.path.exists(profile_tpl):
+        for stem in ("identity", "energy", "growth"):
+            ensure_file(os.path.join("Profile", stem + ".md"),
+                        open(profile_tpl, encoding="utf-8").read())
+
     # 本機區與本機設定：範本進版控，實檔不進
     example_dir = os.path.join(ROOT, "tools", "local.example")
     if os.path.isdir(example_dir):
@@ -2005,7 +2015,7 @@ UPGRADABLE_GLOBS = [
 ]
 # 永遠不跨界的東西。列出來是為了讓「為什麼不是可升級區」看得見，不是給程式判斷用的。
 PRIVATE_NOTE = ("Models/、Frameworks/、Decisions/、Expressions/、Pending/ 的條目，"
-                "MEMORY.md、GLOSSARY.md、tools/local/、tools/stack.config.toml、tools/curation.toml、"
+                "MEMORY.md、GLOSSARY.md、AGENTS.md、Profile/、tools/local/、tools/stack.config.toml、tools/curation.toml、"
                 "tools/regression.tsv")
 
 
