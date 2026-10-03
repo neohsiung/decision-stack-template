@@ -2312,6 +2312,34 @@ def doctor_manifest_rows(manifest):
     return rows
 
 
+def doctor_pr_access_row():
+    """檢查 gh 目前的帳號能不能存取 origin repo。回傳一列 (level, 標籤, 說明)。"""
+    url = (git_out("remote", "get-url", "origin") or "").strip()
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+    if not m:
+        return ("INFO", "PR 存取", f"origin 不是 GitHub（{url or '未設'}），略過")
+    slug = f"{m.group(1)}/{m.group(2)}"
+    try:
+        r = subprocess.run(["gh", "repo", "view", slug, "--json", "name"],
+                           capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        return ("WARN", "PR 存取", "找不到 gh　→ 分支推得上去但開不了 PR")
+    except (OSError, subprocess.SubprocessError) as e:
+        return ("WARN", "PR 存取", f"gh 執行失敗（{e}）")
+    if r.returncode == 0:
+        return ("OK", "PR 存取", f"gh 看得到 {slug}")
+    who = ""
+    try:
+        st = subprocess.run(["gh", "api", "user", "--jq", ".login"],
+                            capture_output=True, text=True, timeout=15)
+        who = st.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ("FAIL", "PR 存取",
+            f"gh 目前帳號（{who or '?'}）看不到 {slug}，step 7 的 PR 會開不成"
+            f"　→ gh auth switch 切到 {m.group(1)}")
+
+
 def cmd_doctor(args):
     """接線體檢：純唯讀。回報「規則有沒有真的到得了各 harness」。
 
@@ -2340,6 +2368,10 @@ def cmd_doctor(args):
                      "——數字變大是待辦不是狀態"))
     else:
         rows.append(("OK", "未合併分支", "0 條"))
+
+    # 1b. 審查閘門：分支推得上去不代表 PR 開得成。gh 目前登入的帳號看不到 origin 時，
+    # 寫入程序 step 7 只會在 gh pr create 印一行錯誤，分支就停在遠端沒有審查請求。
+    rows.append(doctor_pr_access_row())
 
     # 2. pre-commit 閘門（hook 本體跟著 repo 走，hooksPath 是本機設定）
     hooks_path = (git_out("config", "core.hooksPath") or "").strip()
