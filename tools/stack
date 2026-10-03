@@ -572,11 +572,37 @@ def baseline_drift():
     return msgs
 
 
-def unmerged_branches(base="main"):
+def unmerged_branches(base=None):
+    """還有內容沒進 trunk 的本機分支。
+
+    判準是 patch，不是祖先關係。用 rebase 合併的 repo，合併之後分支上的 commit 換了 hash，
+    分支永遠不會變成 trunk 的祖先。只用 `git branch --no-merged` 判，合併過的分支會一直被
+    算成未合併：doctor 的待審數字只增不減，recall 也會把那些分支上的舊版條目掃進來標〔未審〕。
+
+    --no-merged 留著當便宜的前篩，是祖先的一定合併了。剩下的逐條用 `git cherry` 比 patch，
+    有任何一筆 `+`（patch 不在 trunk）才算未合併。cherry 失敗時留著那一條：漏報一條未合併
+    分支，比誤藏一條的代價高。
+
+    基準優先用 origin/main。本機 main 可能落後，拿它比會把已經合進 origin/main 的分支也算成
+    未合併；落後本身由 base_drift 另外報。
+
+    patch 比對認不出改寫過的 commit。合併時被 squash、或內容被手動改過的分支，cherry 仍然
+    回 `+`，它會留在清單上，要人看過才知道內容其實已經在 trunk。
+    """
+    if base is None:
+        base = ("origin/main" if git_out("rev-parse", "--verify", "--quiet",
+                                         "refs/remotes/origin/main") else "main")
     out = git_out("branch", "--no-merged", base, "--format=%(refname:short)")
     if out is None:
         return []
-    return [b.strip() for b in out.splitlines() if b.strip()]
+    keep = []
+    for b in (x.strip() for x in out.splitlines()):
+        if not b:
+            continue
+        ch = git_out("cherry", base, b)
+        if ch is None or any(l.startswith("+") for l in ch.splitlines()):
+            keep.append(b)
+    return keep
 
 
 def load_branch_entries(working):
@@ -1135,7 +1161,10 @@ def cmd_usage(args):
                 if len(parts) < 3:
                     continue
                 day, _, stems = parts[0], parts[1], parts[2]
-                neigh = parts[3] if len(parts) == 4 else ""
+                # >= 4 不是 == 4。寫入端把新欄位接在最後面，就是為了讓這一側不必分版本
+                # （見 log_usage 的註解）。寫成 == 4 會讓 6 欄格式的鄰居欄整欄消失，
+                # 而那是最近才開始寫的那些列，正好是覆盤要看的那一段。
+                neigh = parts[3] if len(parts) >= 4 else ""
                 first, last = first or day, day
                 for bucket, field in ((hits, stems), (near, neigh)):
                     for s in field.split(","):
@@ -2237,6 +2266,28 @@ def registered_hook_commands(settings_path):
     return cmds
 
 
+def pointer_block_sha(target_abs, frag_rel):
+    """目標檔裡那個界定區塊記的 sha12。沒有區塊回 None。
+
+    install 寫區塊時把片段當下的 sha12 蓋進註解。片段之後改過，這個戳記就跟現況對不上。
+    doctor 原本不比它，所以它對著一個已經改過的片段印「驗證過真的載入」，而
+    install --dry-run 同時印「更新區塊（舊 sha=…）」，兩支工具對同一件事給相反答案，
+    而且錯的那一側是會被信的那一側。
+
+    只有 import 與 inherit 有戳記。instructions[] 是 JSON 陣列，install 往裡面加的是
+    一個路徑字串，沒有地方放 sha，所以那一側的飄移目前看不到。回 None 讓它走原本的分支，
+    不要假裝查過。
+    """
+    try:
+        text = open(target_abs, encoding="utf-8").read()
+    except OSError:
+        return None
+    for m in BLOCK_RE.finditer(text):
+        if m.group("frag") == frag_rel:
+            return m.group("sha")
+    return None
+
+
 def pointer_present(target_abs, primitive, fragment_abs):
     """目標檔裡有沒有指向這個片段的指標。回傳 (found, 說明)。
 
@@ -2301,6 +2352,13 @@ def doctor_manifest_rows(manifest):
         found, why = pointer_present(target_abs, primitive, frag_abs)
         if not found:
             rows.append(("FAIL", label, f"{why}（{r.get('target_path')}）"))
+            continue
+        stamped = pointer_block_sha(target_abs, frag_rel)
+        now_sha = sha12(frag_abs)
+        if stamped is not None and stamped != now_sha:
+            rows.append(("WARN", label,
+                         f"{why}，但片段在接線之後改過（區塊記 {stamped}，現在 {now_sha}）。"
+                         "跑 stack install --yes 更新戳記；已經開著的 session 要重開才讀得到新版"))
             continue
         verified = verified_local.get((harness, frag_rel), "")
         if not verified:
