@@ -103,12 +103,32 @@ EXPRESSION_AXES = {
     "audience_role": ["決定者", "執行者", "被諮詢者", "被知會者", "轉傳者"],
     "channel": ["即時訊息", "電子郵件", "票卡留言", "溝通文件", "簡報"],
 }
-# 每層固定分節（WRITING §寫作指南·正文結構）。順序固定。lint 查存在與順序。
+# 每層固定分節（WRITING §寫作指南·正文結構）。機器層在前、人層在後，順序固定。
+#
+# 機器層是 agent 下判斷時要讀的：規則句、步驟、判準、邊界。人層是人 review 時要讀的：
+# 事件、理由、出處。工具讀到人層的第一個標題就可以停，所以兩層的分界靠節名，不靠每層
+# 各自的表。SECTIONS 列機器層的固定順序，HUMAN_SECTIONS 列人層允許的節名。
 SECTIONS = {
     "Models": ["信念", "適用界線", "不適用的情況"],
     "Frameworks": ["用在什麼時候", "步驟或檢查面", "停止條件"],
-    "Decisions": ["規則", "事件", "為什麼", "怎麼用"],
+    "Decisions": ["規則", "怎麼用"],
     EXPRESSIONS: ["適用的格子", "規格", "骨架", "不用它的情況"],
+}
+# 可以整段複製的那一節。stack skeleton 印它；Expression 有 downstream 時它只能是指標加差異。
+SKELETON_SECTION = {EXPRESSIONS: "骨架", "Frameworks": "步驟或檢查面"}
+# 棧外有被執行的那一份時，骨架節的非空行數上限。超過就是把副本抄進來了（SPEC §內容分層）。
+SKELETON_POINTER_MAX = 5
+# 機器層的非空白字數提醒門檻。從遷移後 240 筆的分佈量出來的 p90（中位數 271、p75 441、p90 790），
+# 不是訂出來的。超過是提醒：這一筆大概同時服務了多個檢索情境，或把人層的話寫進了機器層。
+MACHINE_LAYER_CHARS_MAX = 800
+# 機器層之後可以接的選用節，仍屬機器層。只有 Decision 用得到：規則的邊界有時獨立成節。
+MACHINE_OPTIONAL = {"Decisions": ["不適用的情況", "不用它的情況"]}
+# 人層節名。順序不限，但要在機器層全部之後。
+HUMAN_SECTIONS = ("事件", "為什麼", "來由", "實例")
+# 每層至少要有的人層節。Decision 的證據是事件與為什麼；其他三層把理由與出處放在來由。
+HUMAN_REQUIRED = {
+    "Models": ["來由"], "Frameworks": ["來由"], EXPRESSIONS: ["來由"],
+    "Decisions": ["事件", "為什麼"],
 }
 # 新 Decision 一律經 Framework 的生效閘門。判準是條目的 recorded 值。
 #
@@ -146,6 +166,17 @@ def read_curation():
 
 def framework_gate_from():
     return str(read_curation().get("gate", {}).get("framework_from", "") or "")
+
+
+def curation_limits():
+    """tools/curation.toml 的 [limits]。沒有那一節回空 dict，lint 就不查筆數。"""
+    out = {}
+    for k, v in (read_curation().get("limits", {}) or {}).items():
+        try:
+            out[k] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 # 首句規則句不得含的接續記號：一句只講一個意思
@@ -226,6 +257,64 @@ def strip_section(body, heading):
         return body
     nxt = re.search(r"^##\s+", body[m.end():], re.M)
     return body[:m.start()] + (body[m.end() + nxt.start():] if nxt else "")
+
+
+def split_sections(body):
+    """正文切成 (前言, [[標題, 內容], ...])。內容含標題行之後到下一個 `## ` 之前的全部文字。
+
+    join_sections(*split_sections(body)) == body，一個字元都不動。migrate 與 show 共用。
+    """
+    heads = list(re.finditer(r"^##\s+(.+?)\s*$", body, re.M))
+    if not heads:
+        return body, []
+    pre = body[:heads[0].start()]
+    out = []
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+        out.append([m.group(1).strip(), body[m.end():end]])
+    return pre, out
+
+
+def join_sections(pre, sections):
+    return pre + "".join(f"## {h}{t}" for h, t in sections)
+
+
+def machine_body(body):
+    """機器層：正文到人層第一個標題為止。agent 下判斷讀這一段就夠。"""
+    for m in re.finditer(r"^##\s+(.+?)\s*$", body, re.M):
+        if m.group(1).strip() in HUMAN_SECTIONS:
+            return body[:m.start()]
+    return body
+
+
+def section_body(body, heading):
+    """某一節的內容，不含標題。沒有這一節回空字串。"""
+    for h, t in split_sections(body)[1]:
+        if h == heading:
+            return t.strip()
+    return ""
+
+
+def section_order_problem(layer, have):
+    """分節順序對不對。對回 None，不對回一句說哪裡不對。
+
+    判準三條：機器層照 SECTIONS 的順序排在最前；之後只能接 MACHINE_OPTIONAL 與人層節；
+    HUMAN_REQUIRED 列的節要在。
+    """
+    want = SECTIONS[layer]
+    if have[:len(want)] != want:
+        return f"機器層要是 {'→'.join(want)}"
+    rest = have[len(want):]
+    for opt in MACHINE_OPTIONAL.get(layer, []):
+        if rest and rest[0] == opt:
+            rest = rest[1:]
+    odd = [h for h in rest if h not in HUMAN_SECTIONS]
+    if odd:
+        return f"機器層之後只能接人層節（{'／'.join(HUMAN_SECTIONS)}），多了「{'」「'.join(odd)}」"
+    missing = [h for h in HUMAN_REQUIRED[layer] if h not in rest]
+    if missing:
+        return f"缺人層節「{'」「'.join(missing)}」"
+    return None
 
 
 def build_views(fm, body, layer=None):
@@ -392,6 +481,8 @@ AI_TELLS = [
     #   採用的術語，跟「閘門」「骨架」同類。把它們列進來會擋掉正確的寫法。
     # 這兩個不一樣：替代詞明確（不產生訊號、檢查失敗），而且量出來只有 15 處。
     (re.compile(r"靜默|亮紅燈"), "自造比喻"),
+    # 套語。這幾個詞刪掉之後句子資訊不變，留著只是拉長。WRITING 末尾的用詞對照表左欄就是這一行。
+    (re.compile(r"值得注意的是|本質上|換言之|不難發現|某種程度上|賦能|打造"), "套語"),
 ]
 
 # 刻意不做成檢查的，連同理由記在這裡，免得下一輪有人以為是漏掉的：
@@ -658,6 +749,74 @@ def memory_index_paths():
             r"|Expressions/[^)]+\.md)\)", f.read())
 
 
+MEMORY_LINE_RE = re.compile(
+    r"^(?P<head>- \[(?P<title>[^\]]+)\]\((?P<path>(?:Models|Decisions|Frameworks|Expressions)/[^)]+\.md)\))"
+    r"(?: — (?P<summary>.*))?$")
+
+
+def memory_index_lines():
+    """MEMORY.md 逐行解析：[(行號, H2, H3, 標題, 路徑, 摘要)]。只回索引行，分節標題當脈絡帶著。"""
+    if not os.path.exists(MEMORY_PATH):
+        return []
+    rows, h2, h3 = [], None, None
+    with open(MEMORY_PATH, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if line.startswith("## "):
+                h2, h3 = line[3:].strip(), None
+            elif line.startswith("### "):
+                h3 = line[4:].strip()
+            else:
+                m = MEMORY_LINE_RE.match(line)
+                if m:
+                    rows.append((i, h2, h3, m.group("title"), m.group("path"),
+                                 m.group("summary") or ""))
+    return rows
+
+
+def expected_summary(e):
+    """索引行「 — 」之後的摘要就是 description。Expression 前面加對象與渠道，軸是組織鍵。
+
+    中文標題只住在索引裡，它是正本不是副本，這裡不碰。摘要才是會分歧的那一份。
+    """
+    desc = re.sub(r"\s+", " ", e["fm"].get("description", "")).strip()
+    if e["layer"] == EXPRESSIONS:
+        role = e["fm"].get("audience_role", "").strip()
+        ch = e["fm"].get("channel", "").strip()
+        if role and ch:
+            return f"{role}／{ch}；{desc}"
+    return desc
+
+
+def memory_drift(entries):
+    """索引行摘要與 description 不同的：[(行號, 路徑, 現在, 應該)]。"""
+    by = {e["relpath"]: e for e in entries}
+    out = []
+    for lineno, _, _, _, path, summary in memory_index_lines():
+        e = by.get(path)
+        if e is None:
+            continue
+        want = expected_summary(e)
+        if summary != want:
+            out.append((lineno, path, summary, want))
+    return out
+
+
+def memory_sync(entries):
+    """把漂移的索引行摘要改成 description。只動「 — 」之後，分節、順序、標題不動。回改了幾行。"""
+    drift = {lineno: want for lineno, _, _, want in memory_drift(entries)}
+    if not drift:
+        return 0
+    with open(MEMORY_PATH, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    for lineno, want in drift.items():
+        m = MEMORY_LINE_RE.match(lines[lineno - 1])
+        lines[lineno - 1] = f"{m.group('head')} — {want}"
+    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return len(drift)
+
+
 # ---------------------------------------------------------------- 詞彙表
 
 GLOSSARY_PATH = os.path.join(ROOT, "GLOSSARY.md")
@@ -667,6 +826,17 @@ def github_anchor(heading):
     """GitHub 式錨點：小寫、去標點、空白轉連字號。詞彙表標題慣例是 ASCII 術語本名。"""
     h = re.sub(r"[^\w一-鿿 ]", "", heading.strip().lower())
     return h.replace(" ", "-")
+
+
+def glossary_external_anchors():
+    """詞彙表「外部術語」那一節底下的錨點。沒有詞彙表或沒有那一節回空。"""
+    if not os.path.exists(GLOSSARY_PATH):
+        return set()
+    text = re.sub(r"<!--.*?-->", "", open(GLOSSARY_PATH, encoding="utf-8").read(), flags=re.S)
+    m = re.search(r"^## 外部術語\s*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+    if not m:
+        return set()
+    return {github_anchor(h) for h in re.findall(r"^### (.+)$", m.group(1), re.M)}
 
 
 def glossary_sections():
@@ -726,6 +896,30 @@ def glossary_usages():
 
 
 # ---------------------------------------------------------------- 向量
+
+def ollama_status():
+    """("ok" | "no-model" | "down", 說明)。init、install、doctor、setup 四處共用，判準只有一份。"""
+    try:
+        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        return "down", f"連不上 {OLLAMA_URL}（{e}）"
+    names = [m.get("name", "") for m in tags.get("models", [])]
+    if any(n.split(":")[0] == EMBED_MODEL for n in names):
+        return "ok", f"{OLLAMA_URL}　{EMBED_MODEL} 在"
+    return "no-model", f"連上了但沒有 {EMBED_MODEL}"
+
+
+def ollama_pull():
+    """請本機 Ollama 拉嵌入模型。走 /api/pull，跟 embed 同一條路，不假設機器上有 ollama 指令。"""
+    payload = json.dumps({"model": EMBED_MODEL, "stream": False}).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/pull", data=payload, headers={"Content-Type": "application/json"})
+    try:
+        data = json.load(urllib.request.urlopen(req, timeout=EMBED_TIMEOUT))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        return False, f"拉不下來：{e}"
+    return data.get("status") == "success", data.get("status") or json.dumps(data)[:120]
+
 
 def embed(texts):
     payload = json.dumps({"model": EMBED_MODEL, "input": texts}).encode()
@@ -896,6 +1090,11 @@ def cmd_recall(args):
             mark = "  〔未審〕" if e["relpath"] in unreviewed else ""
         print(f"  {score:.3f}  {e['relpath']}  [{kind}]{mark}")
         print(f"         {e['fm'].get('description', '(無 description)')}")
+        if args.expand and not e.get("branch"):
+            # 機器層就是 agent 要照做的全部，印在這裡省掉開檔那一步。分支條目不展開：它未審。
+            for line in machine_body(e["body"]).strip().splitlines():
+                print(f"         {line}" if line.strip() else "")
+            print()
     n_un = sum(1 for _, _, e in hits
                if e.get("branch") or e["relpath"] in unreviewed)
     if n_un:
@@ -1214,6 +1413,55 @@ def cmd_usage(args):
     return 0
 
 
+def show_text(e, audience):
+    """一筆條目給 agent 或人讀的版本。agent 版是 frontmatter 的四個鍵加機器層。"""
+    if audience == "human":
+        return open(os.path.join(ROOT, e["relpath"]), encoding="utf-8").read().rstrip()
+    fm = e["fm"]
+    head = [f"name: {fm.get('name', e['stem'])}", f"description: {fm.get('description', '')}"]
+    if fm.get("upstream"):
+        head.append(f"upstream: {fm['upstream']}")
+    if fm.get("related"):
+        head.append("related: " + fm["related"].replace("\n", "\n  "))
+    return "\n".join(head) + "\n" + machine_body(e["body"]).rstrip()
+
+
+def cmd_show(args):
+    """印一筆條目。--for agent 只印機器層（預設），--for human 印全文。
+
+    agent 版的用途是不開檔：recall 命中之後，這一段就是可以照做的全部。人層留給 review。
+    """
+    entries = load_entries()
+    live = {e["relpath"]: e for e in entries}
+    rel = resolve_entry_ref(args.entry, live)
+    if rel is None:
+        die(f"找不到條目 {args.entry}。可以寫 repo 相對路徑、檔名或 stem")
+    print(show_text(live[rel], getattr(args, "for_", "agent")))
+    return 0
+
+
+def cmd_skeleton(args):
+    """印一筆條目可以整段複製的那一節。Expression 是「骨架」，Framework 是「步驟或檢查面」。
+
+    stdout 只有那一節的內容，接管線就能用。這就是「模板可以被叫出來」：不另開模板目錄，
+    骨架住在它所屬的那一格裡。
+    """
+    entries = load_entries()
+    live = {e["relpath"]: e for e in entries}
+    rel = resolve_entry_ref(args.entry, live)
+    if rel is None:
+        die(f"找不到條目 {args.entry}。可以寫 repo 相對路徑、檔名或 stem")
+    heading = SKELETON_SECTION.get(live[rel]["layer"])
+    if not heading:
+        die(f"{rel} 在 {live[rel]['layer']}，這一層沒有可複製的骨架節。"
+            f"有的是 {'、'.join(f'{k}（{v}）' for k, v in SKELETON_SECTION.items())}")
+    text = section_body(live[rel]["body"], heading)
+    if not text:
+        die(f"{rel} 沒有「{heading}」節")
+    print(text)
+    return 0
+
+
 def cmd_tree(args):
     """依 upstream 印格狀結構——Model 為根、Framework 居中、Decision 為葉。
 
@@ -1489,6 +1737,12 @@ FIX_HINTS = [
      "同一個檔被列了兩次，刪掉其中一行"),
     ("缺 frontmatter",
      "欄位清單與各欄的寫法見 WRITING §frontmatter"),
+    ("沒有 `出處：[名稱](URL)`",
+     "在「來由」第一行寫 `出處：[書名、文章名或作者](公開可讀的網址)`。名稱讓人認得出，連結讓人查得到"),
+    ("索引行摘要與 description 不同",
+     "摘要由 `stack memory --sync` 從 description 產生，不手寫。要改摘要就改 description"),
+    ("跑 stack migrate 搬節",
+     "機器層（規則、步驟、判準、邊界）在前，人層（事件、為什麼、來由、實例）在後。migrate 只搬節不改句子"),
     ("與檔名不符",
      "`name:` 要與檔名（去掉 .md）逐字相同。改其中一邊"),
     ("與資料夾不符",
@@ -1558,6 +1812,12 @@ def cmd_lint(args):
     for p in sorted({x for x in listed if listed.count(x) > 1}):
         problems.append(f"MEMORY.md 重複列出：{p}")
 
+    # 1b. 索引行摘要是 description 的投影。手寫第二份會分歧，而分歧沒有訊號。
+    drift = memory_drift(entries)
+    if drift:
+        notices.append(f"索引行摘要與 description 不同：{len(drift)} 筆，跑 stack memory --sync"
+                       f"（例：{'、'.join(p for _, p, _, _ in drift[:3])}）")
+
     # 2. frontmatter 與規則句
     for e in entries:
         fm = e["fm"]
@@ -1585,33 +1845,71 @@ def cmd_lint(args):
     # 舊條目還沒改寫完之前這三項只提醒；--strict 才擋。改寫完後 pre-commit 改用 --strict。
     strict = getattr(args, "strict", False)
     sink = problems if strict else notices
-    bad_rule, bad_sections, legacy_related, dense = [], [], [], []
+    bad_rule, bad_sections, legacy_related, dense, long_skel = [], [], [], [], []
+    long_machine = []
     tells = {}
     for e in entries:
+        if e["layer"] == EXPRESSIONS and e["fm"].get("downstream"):
+            n = sum(1 for l in section_body(e["body"], "骨架").splitlines() if l.strip())
+            if n > SKELETON_POINTER_MAX:
+                long_skel.append((e["relpath"], n))
         rule = first_rule(e["body"])
         if rule and any(t in rule for t in RULE_FORBIDDEN):
             bad_rule.append(e["relpath"])
-        want = SECTIONS[e["layer"]]
-        have = entry_sections(e["body"])
-        if have[:len(want)] != want:
-            bad_sections.append(e["relpath"])
+        why = section_order_problem(e["layer"], entry_sections(e["body"]))
+        if why:
+            bad_sections.append((e["relpath"], why))
         if re.search(r"\n\s*(?:相關|延伸|參見)[：:]", e["body"]):
             legacy_related.append(e["relpath"])
         d, a = density(e["body"])
         if d > DENSITY_MID_DASH_PER_K or a > DENSITY_AVG_SENTENCE:
             dense.append((e["relpath"], d, a))
-        for name, n in ai_tells(e["body"]):
+        # AI 語只掃機器層。人層的「不是X是Y」常常就是主張本身，報了只會讓整組提醒被忽略。
+        mb = machine_body(e["body"])
+        for name, n in ai_tells(mb):
             tells.setdefault(name, []).append((e["relpath"], n))
+        n_chars = len(re.sub(r"\s", "", mb))
+        if n_chars > MACHINE_LAYER_CHARS_MAX:
+            long_machine.append((e["relpath"], n_chars))
+    # 外部參照要給得出名稱與連結，讀者才不用離站猜。external_reference 沒連結是缺陷；
+    # 其他 origin 的條目引用了詞彙表外部術語而來由沒有連結，先提醒。
+    no_source, cite_only = [], []
+    ext_anchors = glossary_external_anchors()
+    for e in entries:
+        origin_text = section_body(e["body"], "來由")
+        has_link = bool(re.search(r"\]\(https?://", origin_text))
+        if e["fm"].get("origin") == "external_reference":
+            if not has_link:
+                no_source.append(e["relpath"])
+        elif ext_anchors and not has_link and any(
+                f"GLOSSARY.md#{a}" in e["body"] for a in ext_anchors):
+            cite_only.append(e["relpath"])
+    problems.extend(f"{p}：origin 是 external_reference，但「來由」沒有 `出處：[名稱](URL)`"
+                    for p in no_source)
+    if cite_only:
+        notices.append(f"引用了外部術語但「來由」沒有出處連結：{len(cite_only)} 筆"
+                       f"，例：{'、'.join(cite_only[:3])}")
     if bad_rule:
         sink.append(f"首句規則句含接續記號（——／；／：），一句要只講一個意思：{len(bad_rule)} 筆"
                     + ("" if strict else f"，例：{'、'.join(bad_rule[:3])}"))
         if strict:
             problems.extend(f"{p}：首句含接續記號" for p in bad_rule)
     if bad_sections:
-        sink.append(f"分節不符該層固定順序：{len(bad_sections)} 筆"
-                    + ("" if strict else f"，例：{'、'.join(bad_sections[:3])}"))
+        sink.append(f"分節不符「機器層在前、人層在後」：{len(bad_sections)} 筆，跑 stack migrate 搬節"
+                    + ("" if strict else f"，例：{'、'.join(p for p, _ in bad_sections[:3])}"))
         if strict:
-            problems.extend(f"{p}：分節不符 {SECTIONS[p.split('/')[0]]}" for p in bad_sections)
+            problems.extend(f"{p}：{why}" for p, why in bad_sections)
+    if long_machine:
+        long_machine.sort(key=lambda t: -t[1])
+        notices.append(f"機器層超過 {MACHINE_LAYER_CHARS_MAX} 字（分佈的 p90）：{len(long_machine)} 筆"
+                       "，看是不是同時服務多個檢索情境，或把人層的話寫進了機器層。最長："
+                       + "；".join(f"{p}（{n}）" for p, n in long_machine[:3]))
+    if long_skel:
+        sink.append(f"有 downstream 的 Expression 骨架節仍是全文（>{SKELETON_POINTER_MAX} 行）："
+                    f"{len(long_skel)} 筆，棧外有被執行的那一份時只寫路徑加差異"
+                    + ("" if strict else f"，例：{'、'.join(p for p, _ in long_skel[:3])}"))
+        if strict:
+            problems.extend(f"{p}：骨架節 {n} 行，有 downstream 時改成路徑加差異" for p, n in long_skel)
     if legacy_related:
         sink.append(f"正文仍有「相關：」段，要搬到 frontmatter related:：{len(legacy_related)} 筆")
         if strict:
@@ -1722,6 +2020,22 @@ def cmd_lint(args):
           + f"），視角 {sum(len(e['views']) for e in entries)} 個"
           + f"，交叉連結 {sum(len(e['links']) for e in entries)} 條"
           + f"，詞彙表 {len(sections)} 詞")
+
+    # 筆數上限來自 tools/curation.toml [limits]。超過是缺口報告不是缺陷：
+    # Models 超過上限時優先懷疑混進了技法（SPEC §內容分層），分節超過時該拆子節（SPEC §各層契約）。
+    limits = curation_limits()
+    if limits.get("models_max") and counts.get("Models", 0) > limits["models_max"]:
+        notices.append(f"Models {counts['Models']} 筆，超過 [limits] models_max={limits['models_max']}"
+                       "。優先懷疑混進了技法或步驟，走 curation 降級或合併，不放寬判準")
+    if limits.get("section_max"):
+        per = {}
+        for _, h2, h3, *_ in memory_index_lines():
+            if h3:
+                per[(h2, h3)] = per.get((h2, h3), 0) + 1
+        over = [(h3, n) for (_, h3), n in per.items() if n > limits["section_max"]]
+        for h3, n in sorted(over, key=lambda t: -t[1]):
+            notices.append(f"MEMORY.md 子節「{h3}」{n} 筆，超過 [limits] section_max={limits['section_max']}"
+                           "。沿 stack tree 的骨架群拆成幾個子節")
 
     # 上行覆蓋率（缺口報告）：孤兒不是錯誤，是下一輪收斂的原料
     for layer in ("Decisions", "Frameworks"):
@@ -1856,6 +2170,8 @@ def parse_toml_subset(text):
             v = v.strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
                 cur[k.strip()] = v[1:-1]
+            elif re.fullmatch(r"-?\d+", v):
+                cur[k.strip()] = int(v)
     return out
 
 
@@ -2043,15 +2359,14 @@ def cmd_init(args):
         steps.append(("TODO", "commit 身分",
                       "repo-local user.email 未設，pre-commit 的身分閘門形同虛設"
                       "　→ git config user.email <你的個人信箱>"))
-    try:
-        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
-        if any(m.get("name", "").split(":")[0] == EMBED_MODEL for m in tags.get("models", [])):
-            steps.append(("OK", "Ollama", f"{EMBED_MODEL} 在"))
-        else:
-            steps.append(("TODO", "Ollama", f"缺模型　→ ollama pull {EMBED_MODEL}"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+    st, detail = ollama_status()
+    if st == "ok":
+        steps.append(("OK", "Ollama", detail))
+    elif st == "no-model":
+        steps.append(("TODO", "Ollama", f"{detail}　→ ollama pull {EMBED_MODEL}，或 stack setup --pull"))
+    else:
         steps.append(("TODO", "Ollama",
-                      f"連不上 {OLLAMA_URL}。沒有它 recall 會明確失敗，不會靜默降級"
+                      f"{detail}。沒有它 recall 會明確失敗，不會無聲降級"
                       f"　→ ollama serve，然後 ollama pull {EMBED_MODEL}"))
     for level, label, detail in steps:
         print(f"  [{level}] {label}：{detail}")
@@ -2179,6 +2494,7 @@ def cmd_upgrade(args):
     print(f"\n✓ 已開 {branch}，{len(changed) + len(added)} 檔取到工作區並 stage，沒有 commit。")
     print("  先看過再決定：git diff --cached")
     print("  確認之後 commit、push、開 PR。合併在人看過 diff 之後。")
+    print("  分節順序若有變，合併後跑 `stack migrate`：它只搬節、不改句子，lint 會告訴你要不要跑。")
     return 0
 
 
@@ -2228,6 +2544,116 @@ def cmd_contribute(args):
     print(f"  git push {args.remote} HEAD:refs/heads/contrib/{topic}")
     print("  gh pr create -R <template repo>")
     return 0
+
+
+def migrate_body(layer, body):
+    """把一筆正文搬成「機器層在前、人層在後」。只搬節、不改句子。已合規的原樣回傳。
+
+    Decision：把「怎麼用」提到「事件」前。
+    Model 與 Expression：第一節只留到粗體規則句那一段，其餘段落搬進「來由」。
+    Framework：第一節從「出處」開頭那一段起搬進「來由」。
+    「來由」建在機器層之後、既有人層節之前；沒有東西可搬就寫「待補」。
+    """
+    pre, secs = split_sections(body)
+    if not secs:
+        return body
+    have = [h for h, _ in secs]
+    if section_order_problem(layer, have) is None:
+        return body
+    by = {h: t for h, t in secs}
+    machine = SECTIONS[layer]
+    if any(h not in by for h in machine):
+        return body  # 缺機器層的節不是搬節能修的，留給 lint 報
+
+    def paras(text):
+        return [x for x in re.split(r"\n\s*\n", text.strip()) if x.strip()]
+
+    def block(ps):
+        return "\n\n" + "\n\n".join(ps) + "\n\n"
+
+    moved = []
+    first = machine[0]
+    if layer in ("Models", EXPRESSIONS):
+        ps = paras(by[first])
+        idx = next((i for i, x in enumerate(ps) if "**" in x), None)
+        if idx is not None and idx + 1 < len(ps):
+            moved, ps = ps[idx + 1:], ps[:idx + 1]
+            by[first] = block(ps)
+    elif layer == "Frameworks":
+        ps = paras(by[first])
+        idx = next((i for i, x in enumerate(ps) if x.lstrip().startswith("出處")), None)
+        if idx is not None:
+            moved, ps = ps[idx:], ps[:idx]
+            by[first] = block(ps)
+    if "來由" in HUMAN_REQUIRED[layer] and "來由" not in by:
+        by["來由"] = block(moved or ["待補"])
+    elif moved:
+        by["來由"] = block(paras(by["來由"]) + moved)
+
+    order = list(machine)
+    order += [h for h in MACHINE_OPTIONAL.get(layer, []) if h in by]
+    order += [h for h in ("來由",) if h in by and h not in order]
+    order += [h for h in have if h not in order and h in by]
+    secs = [[h, by[h]] for h in order]
+    for s_ in secs:
+        s_[1] = "\n\n" + s_[1].strip() + "\n\n"
+    return join_sections(pre, secs).rstrip() + "\n"
+
+
+def cmd_migrate(args):
+    """把全部條目搬成「機器層在前、人層在後」。只搬節、不改句子。
+
+    已合規的檔不碰。搬不動的（缺機器層的節、節名不在表上）列出來交給人。
+    """
+    changed, stuck = [], []
+    for e in load_entries():
+        new = migrate_body(e["layer"], e["body"])
+        why = section_order_problem(e["layer"], entry_sections(new))
+        if why:
+            stuck.append((e["relpath"], why))
+        if new == e["body"]:
+            continue
+        changed.append(e["relpath"])
+        if not args.dry_run:
+            path = os.path.join(ROOT, e["relpath"])
+            text = open(path, encoding="utf-8").read()
+            end = text.find("\n---\n", 4)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text[:end + 5] + new)
+    tag = "[dry-run] 會搬" if args.dry_run else "搬了"
+    print(f"{tag} {len(changed)} 筆：")
+    for p in changed:
+        print(f"  ~ {p}")
+    if stuck:
+        print(f"\n搬不動的 {len(stuck)} 筆，要人手改：")
+        for p, why in stuck:
+            print(f"  ✗ {p}：{why}")
+    if not args.dry_run and changed:
+        print("\n下一步：git diff 看搬動對不對，stack lint，stack eval 對基線。")
+    return 1 if stuck else 0
+
+
+def cmd_memory(args):
+    """索引行摘要與 description 對帳。--check 只報漂移（有就回 1），--sync 改寫。
+
+    分節、順序、中文標題都是人寫的，這支工具不碰。它只讓「 — 」之後那段不再是第二份手寫稿。
+    """
+    entries = load_entries()
+    if args.sync:
+        n = memory_sync(entries)
+        print(f"改了 {n} 行摘要。分節、順序、標題沒動。" if n else "索引行摘要都跟 description 一致，沒動。")
+        return 0
+    drift = memory_drift(entries)
+    if not drift:
+        print("索引行摘要都跟 description 一致。")
+        return 0
+    print(f"{len(drift)} 行摘要與 description 不同：")
+    for lineno, path, now, want in drift[:args.limit]:
+        print(f"  L{lineno} {path}\n    現在：{now}\n    應該：{want}")
+    if len(drift) > args.limit:
+        print(f"  … 另 {len(drift) - args.limit} 行")
+    print("\n跑 stack memory --sync 改寫。")
+    return 1
 
 
 def cmd_index(args):
@@ -2489,17 +2915,13 @@ def cmd_doctor(args):
                 ("FAIL", "commit 身分", "repo-local user.email 未設，身分閘門形同虛設"))
 
     # 4. 檢索能力：Ollama 不在是降級不是失效，所以 WARN 不 FAIL
-    try:
-        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
-        names = [m.get("name", "") for m in tags.get("models", [])]
-        if any(n.split(":")[0] == EMBED_MODEL for n in names):
-            rows.append(("OK", "Ollama", f"{OLLAMA_URL}　{EMBED_MODEL} 在"))
-        else:
-            rows.append(("WARN", "Ollama", f"連上了但沒有 {EMBED_MODEL}"
-                                           f"　→ ollama pull {EMBED_MODEL}"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-        rows.append(("WARN", "Ollama", f"連不上 {OLLAMA_URL}（{e}）"
-                                       "　→ recall 會明確失敗並提示改讀 MEMORY.md"))
+    st, detail = ollama_status()
+    if st == "ok":
+        rows.append(("OK", "Ollama", detail))
+    elif st == "no-model":
+        rows.append(("WARN", "Ollama", f"{detail}　→ ollama pull {EMBED_MODEL}"))
+    else:
+        rows.append(("WARN", "Ollama", f"{detail}　→ recall 會明確失敗並提示改讀 MEMORY.md"))
 
     # 5. 索引新鮮度（純衍生物，過期是 recall 自己會修的事）
     entries = load_entries()
@@ -2740,7 +3162,7 @@ def cmd_install(args):
     if not write:
         print("[dry-run] 只列計畫，不動任何檔案（要真的寫入請加 --yes）\n")
 
-    # 本機前置：hook 路徑與身分閘門。工具不代跑 ollama pull，也不 commit
+    # 本機前置：hook 路徑與身分閘門。install 不代跑 ollama pull（setup --pull 才拉），也不 commit
     steps = []
     hooks_path = (git_out("config", "core.hooksPath") or "").strip()
     if hooks_path != "tools/hooks":
@@ -2754,14 +3176,13 @@ def cmd_install(args):
     if not (git_out("config", "--local", "user.email") or "").strip():
         steps.append(("FAIL", "commit 身分", "repo-local user.email 未設，pre-commit 的身分閘門"
                                              "形同虛設　→ git config user.email <你的個人信箱>"))
-    try:
-        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
-        if any(m.get("name", "").split(":")[0] == EMBED_MODEL for m in tags.get("models", [])):
-            steps.append(("OK", "Ollama", f"{EMBED_MODEL} 在"))
-        else:
-            steps.append(("TODO", "Ollama", f"缺模型　→ 請自己跑：ollama pull {EMBED_MODEL}"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        steps.append(("TODO", "Ollama", f"連不上 {OLLAMA_URL}　→ ollama serve 後再跑 stack index"))
+    st, detail = ollama_status()
+    if st == "ok":
+        steps.append(("OK", "Ollama", detail))
+    elif st == "no-model":
+        steps.append(("TODO", "Ollama", f"{detail}　→ 自己跑 ollama pull {EMBED_MODEL}，或 stack setup --pull"))
+    else:
+        steps.append(("TODO", "Ollama", f"{detail}　→ ollama serve 後再跑 stack index"))
     steps.append(plan_shim(write))
     if not os.path.exists(INDEX_PATH):
         steps.append(("TODO", "向量索引", "還沒建立　→ tools/stack index"))
@@ -2843,6 +3264,54 @@ def cmd_install(args):
     return cmd_doctor(argparse.Namespace(quiet=False, json=False, self_test=False))
 
 
+def cmd_setup(args):
+    """一路跑完換機器或開新棧要做的事。每一步沿用各自的「已存在不覆蓋」，重跑一次全部是 OK。
+
+    init（目錄、索引骨架、本機區、hooksPath）→ Ollama 與模型（--pull 才代拉）→ 向量索引
+    （只嵌過期的）→ install（--yes 才寫入各 harness，否則列計畫）→ doctor。
+    不是 git repo 時跳過 install 與 doctor 的接線部分，印出下一步。
+    """
+    print("=== 1/4 init ===")
+    cmd_init(args)
+
+    print("\n=== 2/4 Ollama ===")
+    st, detail = ollama_status()
+    if st == "no-model" and args.pull:
+        print(f"  缺 {EMBED_MODEL}，開始拉（幾百 MB，看網路幾分鐘）…")
+        ok, msg = ollama_pull()
+        print(f"  {'✓' if ok else '✗'} {msg}")
+        st, detail = ollama_status()
+    mark = {"ok": "✓", "no-model": "△", "down": "△"}[st]
+    print(f"  {mark} {detail}")
+    if st == "no-model":
+        print(f"    → ollama pull {EMBED_MODEL}，或重跑 stack setup --pull")
+    elif st == "down":
+        print("    → ollama serve，然後重跑這一支。沒有它 recall 會明確失敗，不會無聲降級")
+
+    print("\n=== 3/4 向量索引 ===")
+    entries = load_entries()
+    if not entries:
+        print("  棧是空的，沒有東西可嵌。第一批條目看 skills/decision-stack-bootstrap/SKILL.md")
+    elif st != "ok":
+        print("  Ollama 還沒好，跳過。好了之後跑 stack index，或任何一次 recall 會自動補")
+    else:
+        ensure_index(entries, force=False, verbose=True)
+        print(f"  ✓ {len(entries)} 筆都在索引裡")
+
+    print("\n=== 4/4 接線 ===")
+    if args.skip_install:
+        print("  --skip-install：不碰任何 harness 的設定檔")
+        return cmd_doctor(argparse.Namespace(quiet=True, json=False, self_test=False))
+    if git_out("rev-parse", "--show-toplevel") is None:
+        print("  這裡還不是 git repo，接線要等 git init 之後：git init && stack install --yes")
+        return 0
+    rc = cmd_install(argparse.Namespace(harness=None, dry_run=not args.yes, yes=args.yes,
+                                        relocate=args.relocate))
+    if not args.yes:
+        print("\n上面是計畫。確認沒問題就重跑：stack setup --yes" + (" --pull" if args.pull else ""))
+    return rc
+
+
 def die(msg):
     print(f"stack: {msg}", file=sys.stderr)
     sys.exit(2)
@@ -2860,6 +3329,8 @@ def main():
                    help="只掃工作目錄，不掃未合併分支（預設會掃）")
     r.add_argument("--stale-ok", action="store_true",
                    help="唯讀：用既有索引比對、不重嵌不寫檔；過期與全新條目明列（計畫模式用）")
+    r.add_argument("--expand", action="store_true",
+                   help="每筆命中印出機器層（規則、步驟、判準、邊界），agent 不必再開檔")
     r.set_defaults(func=cmd_recall)
 
     s = sub.add_parser("shape", help="全量 cluster：收斂候選與拆分候選")
@@ -2907,8 +3378,34 @@ def main():
     ini = sub.add_parser("init", help="建立一個新的決策棧。已存在的檔案不覆蓋")
     ini.set_defaults(func=cmd_init)
 
+    su = sub.add_parser("setup", help="一路跑完：init → Ollama → 索引 → install → doctor。重跑無害")
+    su.add_argument("--yes", action="store_true", help="真的寫入各 harness 的接線；沒有它 install 只列計畫")
+    su.add_argument("--pull", action="store_true", help=f"缺 {EMBED_MODEL} 時代跑拉模型；沒有它只提示")
+    su.add_argument("--relocate", action="store_true", help="repo 換過位置，明示要改掉所有指標")
+    su.add_argument("--skip-install", action="store_true", help="不碰任何 harness 設定檔，只做本機與索引。CI 與測試用")
+    su.set_defaults(func=cmd_setup)
+
     i = sub.add_parser("index", help="強制重建向量索引")
     i.set_defaults(func=cmd_index)
+
+    me = sub.add_parser("memory", help="索引行摘要與 description 對帳：--check 報漂移、--sync 改寫")
+    me.add_argument("--sync", action="store_true", help="改寫漂移的摘要；沒有它只報")
+    me.add_argument("--check", action="store_true", help="只報（預設）")
+    me.add_argument("--limit", type=int, default=10, help="最多列幾行（預設 10）")
+    me.set_defaults(func=cmd_memory)
+
+    sh = sub.add_parser("show", help="印一筆條目：--for agent 只印機器層（預設），--for human 印全文")
+    sh.add_argument("entry", help="repo 相對路徑、檔名或 stem")
+    sh.add_argument("--for", dest="for_", choices=["agent", "human"], default="agent")
+    sh.set_defaults(func=cmd_show)
+
+    sk = sub.add_parser("skeleton", help="印一筆條目可複製的那一節：Expression 的骨架、Framework 的步驟")
+    sk.add_argument("entry", help="repo 相對路徑、檔名或 stem")
+    sk.set_defaults(func=cmd_skeleton)
+
+    mg = sub.add_parser("migrate", help="把條目搬成「機器層在前、人層在後」。只搬節、不改句子")
+    mg.add_argument("--dry-run", action="store_true", help="只列會搬哪些檔")
+    mg.set_defaults(func=cmd_migrate)
 
     rt = sub.add_parser("root", help="印 repo root。給腳本與契約片段用，取代寫死路徑")
     rt.set_defaults(func=cmd_root)
@@ -2939,8 +3436,8 @@ def main():
     co.set_defaults(func=cmd_contribute)
 
     args = p.parse_args()
-    # init 要建的正是 assert_repo_root 要找的目錄，所以它在檢查之前跑
-    if getattr(args, "func", None) is not cmd_init:
+    # init 與 setup 要建的正是 assert_repo_root 要找的目錄，所以它們在檢查之前跑
+    if getattr(args, "func", None) not in (cmd_init, cmd_setup):
         assert_repo_root()
         # 正常時完全不印。一份天天報錯的檢查會被停止閱讀，然後真正的訊號會跟著
         # 一起被略過——這是 guard-must-cover-every-writer 的直接要求。
