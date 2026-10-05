@@ -16,6 +16,8 @@ kilo	~/.config/kilo/kilo.json	instructions[]	tools/context/write-procedure.md	-
 kilo	~/.config/kilo/kilo.json	instructions[]	tools/context/source-marking.md	-
 kilo	~/.config/kilo/kilo.json	instructions[]	AGENTS.md	-
 gemini	~/.gemini/GEMINI.md	import	tools/context/usage-contract.md	-
+gemini	~/.gemini/GEMINI.md	import	tools/context/write-procedure.md	-
+gemini	~/.gemini/GEMINI.md	import	tools/context/source-marking.md	-
 gemini	~/.gemini/GEMINI.md	import	AGENTS.md	-
 cursor	-	unwired	-	declared:no-user-level-file-channel
 explore	-	unwired	-	declared:builtin-agent-type-no-definition-file

@@ -25,7 +25,7 @@
 不成立的有三個去處。本機狀態進 `tools/local/`。個人事故的證據段留在私有 repo 的條目裡。兩者都
 不是的刪掉。`stack lint --shippable` 機械檢查這一組，pre-commit 對每次 commit 跑它。
 
-第一組擋名字。第二組擋「這台機器的 gh 有公司帳號」這類沒有名字、但只對一個人一台機器成立的
+第一組擋名字。第二組擋「本機機器的 gh 有公司帳號」這類沒有名字、但只對一個人一台機器成立的
 句子。只做第一組不會對第二類產生任何訊號。
 
 **第三組問領域：拿掉職權、離開工作，這句話還成立嗎？** 判斷原則管的是一個人怎麼下判斷，不是
@@ -47,6 +47,7 @@
 | 思考骨架 | `Frameworks/` | 思考與作業的骨架。回答「怎麼下判斷」。收兩類：作業骨架（格式、結構、有序步驟、並列判準）與思考技法（有步驟、檢查面或多軸展開的思考方法，例：五個為什麼） | 內容是結構或方法。不綁單一產物 |
 | 事件原則 | `Decisions/` | 由具體事件或糾正揭露的判斷原則。最下游 | 說得出一個觸發它的事件，以及它依據的基準：Model 或 Framework |
 | 產出用語 | `Expressions/` | 一格產出該用什麼詞、什麼語氣、放哪些內容，照作者本人的講法。加上可複製的骨架。回答「這次要寫成什麼樣」 | 對象與渠道兩個維度落得下來。它是推導鏈末端產物的形狀，不是鏈上的第四環 |
+| 工作流 | `Pipelines/` | 一類事怎麼跑：觸發、輸入、步驟、輸出、需要的能力。去識別化、工具中立，換場域時拿能力清單對當下的工具重建 | 類別與節奏兩個維度落得下來。它是流程不是判斷，跟 Expressions 一樣是目錄不是層 |
 | 承載層 | `tools/` 加 `skills/` | 讓這份內容可被檢索、可被維護的最小工具集與程序 | 換到任何 harness 或服務都需要它才能用這份內容 |
 | 下游產物 | 棧外 | 綁組織識別的 skill、指南、制度設計、表單設計 | 由上游層的 `downstream:` 指向。不進這個 repo |
 
@@ -75,6 +76,23 @@
 跨層的檔案不硬切。一份東西前半是判斷、後半是製作說明時，留在較上游的那一層，把製作說明那半
 用 `downstream:` 標出去。等它下次真的被引用時再決定要不要拆檔。
 
+### 機器層與人層
+
+每筆條目的正文分兩層，四層共用同一條規則：**機器層在前，人層在後，人層由固定的節名標界**。
+機器層是 agent 下判斷時要讀的，規則句、步驟、判準、邊界；人層是人 review 時要讀的，事件、
+理由、出處。工具讀到人層的第一個標題就停，不必知道哪一層有哪些節。各層的節名與順序見
+WRITING §正文結構，`lint` 查順序，`stack migrate` 把舊順序搬成新順序。
+
+分兩層的理由：`recall` 只印 description，agent 要用時整檔讀進 context，人層跟著進來。那是
+token 的浪費，也是小模型讀到比喻與修辭就走偏的來源。機器層的句子因此另有三條句型規則，在
+WRITING §正文結構。人層不受那三條約束，它寫給下一個 review 的人，要讀得出為什麼機器層長這樣。
+
+語言維持單一正本，繁體中文。不另維護英文副本，兩份會各自演化而分歧沒有訊號。agent 用什麼
+語言查都可以，嵌入模型跨語言，差距用 `stack eval` 的英文題量，不用假設。量過一次：
+`tools/regression.tsv` 的 10 題英譯題，9 題名次跟中文原題差在 2 名以內，1 題從第 5 掉到第 17，
+那題是兩個類比串成的長句，中文版本身也只在第 5。結論是不加英文欄位；要查詢語言自由，
+代價是長句類比題要拆短問。
+
 ### 各層契約：目標、權責、異動條件
 
 越上層越抽象、越穩定。`Models` 是少數不變的核心信念：為什麼這樣思考，換掉所有情境與步驟仍
@@ -86,7 +104,8 @@
 Model 與 Framework 的分界一句話：信念解釋動機，[骨架](GLOSSARY.md#骨架)給出方法。一筆 Model 寫著寫著長出檢查面、
 步驟清單或多欄展開，就是它其實是 Framework、或該拆成一句信念加一副骨架的訊號。「一句話說得完」
 仍是 Model 的必要條件，但不充分。一句話說得完的方法，例如技法口訣，也是 Framework。Models 的
-預期規模是 5 到 15 筆。超過時優先懷疑混進了技法，不放寬判準。
+預期規模是 5 到 15 筆。超過時優先懷疑混進了技法，不放寬判準。這個數字與「單一主題超過 30 筆再議」
+寫在 `tools/curation.toml` 的 `[limits]`，`stack lint` 超過就提醒。它們是這座棧的判準，不是工具的。
 
 決策必有基準。一筆 Decision 的判斷依據來自某個 Model 或某個 Framework。說不出基準的決策沒有
 可檢驗的依據。所以 Decision 的 `upstream:` 對新條目是必備，這是寫入程序 step 3 的基準閘門，見
@@ -158,6 +177,43 @@ upstream 覆蓋率的缺口報告。
 條目因為缺它而撞在同一格、寫法卻不同；固定其他軸的值它還能獨立變動。第二個條件是唯一的煞車，
 沒有它軸會依預想增加，而空格不是待辦，是當初不該切出來的刻度。條件不成立時那個區別寫進
 「規格」節，它不會消失，只是不當索引鍵。
+
+### Pipelines 的軸
+
+**兩個維度：類別、節奏。** 一條 pipeline 是一類事怎麼跑的流程文檔，去識別化、工具中立。
+
+| 鍵 | 它回答哪一題 | 值 |
+|---|---|---|
+| `pipeline_kind` | 這條流程服務哪一種工作 | 技術、管理、後設（維護這套工作流本身的流程） |
+| `cadence` | 多久跑一次 | 每日、每週、每月、每季、每半年、每年、事件觸發 |
+
+正文五節機器層：觸發、輸入、步驟、輸出、需要的能力。「需要的能力」用抽象能力詞（任務系統、
+行事曆、郵件、文件、票務、程式碼平台、CI、監控、聊天室、人資表單、session 紀錄、記憶層、決策棧），
+不寫系統名。重建時一個能力對一個工具。`downstream:` 指向現在被執行的那一份：harness repo 裡的
+排程任務、skill 或 agent，只寫名字與所屬 repo。
+
+Pipelines 跟 Expressions 的分界一句：**Expressions 管一格產出寫成什麼樣，Pipelines 管一類事
+從觸發到產出怎麼跑。** 一條 pipeline 的輸出常常就是某一格 Expression，用 `related:` 對照。
+
+**裝置啟用。** 目錄是全集，每台裝置跑的是子集。本機啟用表 `tools/local/pipelines.tsv`（不進版控）記本機
+要跑哪幾條、實作在本機哪裡、上一次對帳的日期。一條流程在一台裝置上有三種狀態：啟用、停用、未決定（目錄有、
+表裡沒有）。新裝置全部未決定；棧新增一條之後，每台裝置 pull 到它就是未決定，`stack doctor` 會提示到有人
+`stack pipelines enable` 或 `disable` 為止。接線建議（哪條流程的實作在哪個 harness repo 的哪個路徑）住在個人
+harness repo 的 `pipelines.tsv`，`enable` 查它把路徑填進啟用表；repo 別名對應 `tools/stack.config.toml` 的
+`[harness]`。對帳日放啟用表不放 frontmatter：對帳是「本機的實作」對「文檔」，不同裝置可以不同，而且日期不該
+進可公開的條目。
+
+**漂移有訊號。** `stack pipelines drift` 只看啟用的：實作在 harness repo 的最後 commit 晚於對帳日，列「實作
+改了，文檔沒跟」；文檔在棧的最後 commit 晚於對帳日，列「文檔改了，實作沒跟」。都量日期不比內容，內容對帳是人的
+判斷。看過一致就 `stack pipelines reconcile <stem>`。這是月級訊號：每月的工作流月檢與 curation 的 Step 1 看它，
+每日流程不報。
+
+下游產物的收錄：`downstream:` 指到的本機檔案要在版控裡。綁組織的進公司側的 harness repo，不綁的
+進個人側的 harness repo，服務棧內容本身的在這裡的 `skills/`。哪個都不是就是漏，`stack doctor` 會報。
+每一條 skill、agent、排程都可以拆成兩半：通用核心（方法、判準、檢查清單、題庫骨架）與公司綁定
+（職等表、表單、系統 ID、名冊）。通用核心進個人側，綁定進公司側，Pipelines 寫的是通用那一半。被執行的那一份
+也該有自己的藍綠：改之前在旁邊的 worktree 開一個綠副本，以 `<名>-green` 接進 harness 驗過，才讓藍指過去。
+做法由 harness repo 的 bootstrap 給，棧只在 `stack doctor` 的 `green` 列報有幾個綠副本開著、開了幾天。
 
 引用效率的規則：族譜關係一律走 `upstream:`，近似但不等價的對照走 frontmatter `related:`。有共同
 上游的兄弟條目不再互寫增補。兄弟經由上游找到，`recall` 的一跳鄰居沿 upstream 展開。新增成員時
@@ -245,6 +301,7 @@ mem0 鏡射閘門：只有 `origin: judgment_case` 寫 mem0，`MEMORY.md` 這一
 - `Decisions/`：事件原則。信念或骨架在單一事件上的具體結果。
 - `AGENTS.md`、`Profile/`：個人檔案，關於這個人的事實。不是一層，`recall` 不掃。見 §個人檔案。
 - `Expressions/`：一格產出的用詞、語氣與內容取捨，加上可複製的骨架。檢索鍵是對象與渠道兩個維度。
+- `Pipelines/`：一類事怎麼跑，觸發到產出，工具中立。檢索鍵是類別與節奏兩個維度。
 - `MEMORY.md`：索引，一行一筆。
 - `GLOSSARY.md`：詞彙表。外部具名術語的定義與原始定義出處。條目照用縮寫，內文首次出現時連到
   錨點。本表列回引用它的檔案。雙向一致性由 `stack lint` 檢查。
@@ -269,6 +326,9 @@ mem0 鏡射閘門：只有 `origin: judgment_case` 寫 mem0，`MEMORY.md` 這一
 各 harness 的使用者層指令檔，所以它全域載入。會解析 `@` 匯入的 harness 連內文一起讀，不解析的
 至少讀得到摘要與路徑。
 
+`stack export --public`（出版用匯出，排除 `Profile/`、`Pending/`、`tools/local/`）是下一個工具項，
+還沒做。出版的單位是去識別化後的三層加兩個目錄，身分層不出去。
+
 **歸屬。** 骨架在 `templates/agents.md` 與 `templates/profile.md`，由 `stack init` 建出實檔。
 實檔不在可升級區，`upgrade` 不覆蓋，`contribute` 不送出。
 
@@ -286,12 +346,23 @@ stack eval                # 召回率回歸。改嵌入、換模型、大批拆�
 stack usage               # 使用記錄報表：命中統計、log 覆蓋區間、淘汰候選
 stack doctor              # 接線體檢，唯讀
 stack install --yes       # 接線、建 shim、設 hooksPath
+stack migrate             # 把條目搬成「機器層在前、人層在後」。只搬節、不改句子
+stack memory --sync       # 索引行摘要改成 description 的投影。--check 只報漂移
+stack pipelines list      # 本機對流程目錄的狀態：未決定、啟用、停用。init 逐條問，enable／disable 單條
+stack pipelines drift     # 啟用的流程，實作與文檔誰改了沒跟上。reconcile <stem> 記下對過
+stack journal new "<決定>"  # 決策日誌：new／due／review／stats，日誌在棧外自己的私有 repo
+stack skeleton <條目>     # 印可以整段複製的那一節：Expression 的骨架、Framework 的步驟
 ```
 
 工具版本在 `tools/VERSION`。`stack recall` 的輸出格式、frontmatter 欄位、資料夾名視為公開
 介面，破壞性變更要提 major。`stack doctor` 會印目前版本。
 
 `stack` 是 `stack install` 建在 `~/.local/bin` 的 symlink，指向 `tools/stack`。任何目錄都叫得動。
+
+**改工具前先在 worktree 驗。** shim 指的是 repo，切分支等於切版本，所以不在主工作樹上改工具。
+`git worktree add ../decision-stack-green <分支>`，用絕對路徑呼叫 `<綠>/tools/stack`，跑完 `lint`、
+`lint --shippable`、`eval` 對基線、`doctor --self-test`、`doctor` 無 FAIL，再在 template 複本跑
+`setup --skip-install` 兩次，才開 PR。主工作樹留在 main，正在跑的 session 用的永遠是審過的版本。
 契約片段裡寫的就是這個裸名。絕對路徑是每台機器都不一樣的值，不放進要被各 harness 直接載入的
 文字裡。
 
