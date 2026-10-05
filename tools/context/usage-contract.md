@@ -8,13 +8,16 @@
 一格產出該用什麼詞、什麼語氣、放哪些內容，以及可以照抄的骨架。索引在 `MEMORY.md`。檢索用：
 
 ```bash
-stack recall "<一段話>"
+stack recall --expand "<一段話>"
 ```
 
 `stack` 是這個 repo 的 CLI。`stack install` 會把它 symlink 到 PATH 上，任何工作目錄都叫得動。
 叫不動時跑 `stack doctor` 看接線。
 
 它掃全部條目，回 top-k 加一跳連結鄰居。覆蓋率由程式迴圈保證，不靠人記得有沒有讀完。
+
+`--expand` 把每筆命中的機器層一起印出來：規則句、步驟、判準、邊界。拿到就能照做，不必再開檔。
+人層（事件、為什麼、來由）是給 review 用的，要看時跑 `stack show <條目> --for human`。
 
 ### 兩個觸發時機
 

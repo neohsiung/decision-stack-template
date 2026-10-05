@@ -1,0 +1,5 @@
+stem	enabled	path	reconciled
+# 本機的流程啟用表，由 stack pipelines 維護，不進版控。
+# stem：Pipelines/ 底下的檔名。enabled：yes 或 no。path：本機的實作路徑，逗號分隔可多筆。
+# reconciled：上一次確認文檔與實作一致的日期，由 stack pipelines reconcile 寫。
+# 目錄裡有、這張表沒有的流程是「未決定」，doctor 會提示；stack pipelines init 逐條問。

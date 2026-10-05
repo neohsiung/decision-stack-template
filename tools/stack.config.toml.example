@@ -6,6 +6,16 @@
 # workspace = "<你的 mem0 workspace>"
 # project   = "<你的 mem0 project>"
 
+# harness repo 的本機位置。stack pipelines 用它把接線建議表的 repo 別名換成路徑，doctor 用它報 repo 新不新。
+# 別名自訂，常見是 personal（通用 skill 與接線建議表）與 company（綁組織的 wrapper、agent、排程）。
+# [harness]
+# personal = "~/Personal/harness"
+# company  = "~/Work/agent-harness"
+
+# 決策日誌的位置。一個獨立的私有 repo，格式見 templates/journal-entry.md。沒設就不能用 stack journal。
+# [journal]
+# path = "~/Personal/decision-journal"
+
 # 個人 GitHub 帳號。gh 的作用中帳號可能是別的。
 # 工具用 GH_TOKEN=$(gh auth token --user <這個值>) 取權杖，不切全域帳號。
 # [github]

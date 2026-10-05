@@ -85,8 +85,11 @@ LAYERS = {"Models": "model", "Decisions": "decision", "Frameworks": "framework"}
 # 末端產物的形狀規格，不是鏈上的第四環。所以它的檢索鍵是下面三軸，不是 upstream，也不進
 # tree 的格狀結構與孤兒報告。同一個前例見 write-procedure.md §step 3 的「Pending/ 不是第四層」。
 EXPRESSIONS = "Expressions"
-# 掃描範圍＝三層加 Expressions。分層邏輯（rank、tree、孤兒覆蓋率）一律只走 LAYERS。
-SCAN_DIRS = {**LAYERS, EXPRESSIONS: "expression"}
+# Pipelines 也是目錄，不是層。它裝的是「這類事怎麼跑」：去識別化、工具中立的流程，換場域時
+# 拿「需要的能力」那一節對當下的工具重建。檢索鍵是類別與節奏兩軸，upstream 選填。
+PIPELINES = "Pipelines"
+# 掃描範圍＝三層加兩個目錄。分層邏輯（rank、tree、孤兒覆蓋率）一律只走 LAYERS。
+SCAN_DIRS = {**LAYERS, EXPRESSIONS: "expression", PIPELINES: "pipeline"}
 # 兩個維度，三個鍵。對象由方向與權責兩件事決定，所以機械上拆兩個鍵。
 #
 # 渠道記的是讀者以什麼方式接觸到這份東西，不是它用哪套軟體送出去的。所以報告、提案、
@@ -103,6 +106,14 @@ EXPRESSION_AXES = {
     "audience_role": ["決定者", "執行者", "被諮詢者", "被知會者", "轉傳者"],
     "channel": ["即時訊息", "電子郵件", "票卡留言", "溝通文件", "簡報"],
 }
+# Pipelines 的兩軸。類別分技術、管理、後設（後設是維護這套工作流本身的流程）；節奏是它多久跑一次，
+# 事件觸發是沒有固定節奏的那種。兩軸都是組織鍵：管 lint、管索引分組、管矩陣看哪一格沒填。
+PIPELINE_AXES = {
+    "pipeline_kind": ["技術", "管理", "後設"],
+    "cadence": ["每日", "每週", "每月", "每季", "每半年", "每年", "事件觸發"],
+}
+# 有軸的目錄共用同一套檢查：缺軸是缺陷，值要在受控詞彙裡。
+AXES = {EXPRESSIONS: EXPRESSION_AXES, PIPELINES: PIPELINE_AXES}
 # 每層固定分節（WRITING §寫作指南·正文結構）。機器層在前、人層在後，順序固定。
 #
 # 機器層是 agent 下判斷時要讀的：規則句、步驟、判準、邊界。人層是人 review 時要讀的：
@@ -113,9 +124,10 @@ SECTIONS = {
     "Frameworks": ["用在什麼時候", "步驟或檢查面", "停止條件"],
     "Decisions": ["規則", "怎麼用"],
     EXPRESSIONS: ["適用的格子", "規格", "骨架", "不用它的情況"],
+    PIPELINES: ["觸發", "輸入", "步驟", "輸出", "需要的能力"],
 }
 # 可以整段複製的那一節。stack skeleton 印它；Expression 有 downstream 時它只能是指標加差異。
-SKELETON_SECTION = {EXPRESSIONS: "骨架", "Frameworks": "步驟或檢查面"}
+SKELETON_SECTION = {EXPRESSIONS: "骨架", "Frameworks": "步驟或檢查面", PIPELINES: "步驟"}
 # 棧外有被執行的那一份時，骨架節的非空行數上限。超過就是把副本抄進來了（SPEC §內容分層）。
 SKELETON_POINTER_MAX = 5
 # 機器層的非空白字數提醒門檻。從遷移後 240 筆的分佈量出來的 p90（中位數 271、p75 441、p90 790），
@@ -127,7 +139,7 @@ MACHINE_OPTIONAL = {"Decisions": ["不適用的情況", "不用它的情況"]}
 HUMAN_SECTIONS = ("事件", "為什麼", "來由", "實例")
 # 每層至少要有的人層節。Decision 的證據是事件與為什麼；其他三層把理由與出處放在來由。
 HUMAN_REQUIRED = {
-    "Models": ["來由"], "Frameworks": ["來由"], EXPRESSIONS: ["來由"],
+    "Models": ["來由"], "Frameworks": ["來由"], EXPRESSIONS: ["來由"], PIPELINES: ["來由"],
     "Decisions": ["事件", "為什麼"],
 }
 # 新 Decision 一律經 Framework 的生效閘門。判準是條目的 recorded 值。
@@ -744,14 +756,14 @@ def memory_index_paths():
     if not os.path.exists(MEMORY_PATH):
         return []
     with open(MEMORY_PATH, encoding="utf-8") as f:
-        return re.findall(
-            r"\]\((Models/[^)]+\.md|Decisions/[^)]+\.md|Frameworks/[^)]+\.md"
-            r"|Expressions/[^)]+\.md)\)", f.read())
+        dirs = "|".join(re.escape(d) for d in SCAN_DIRS)
+        return re.findall(rf"\]\(((?:{dirs})/[^)]+\.md)\)", f.read())
 
 
+# 索引行的形狀。目錄清單跟 SCAN_DIRS 走，加一個目錄不用回頭改這裡。
 MEMORY_LINE_RE = re.compile(
-    r"^(?P<head>- \[(?P<title>[^\]]+)\]\((?P<path>(?:Models|Decisions|Frameworks|Expressions)/[^)]+\.md)\))"
-    r"(?: — (?P<summary>.*))?$")
+    r"^(?P<head>- \[(?P<title>[^\]]+)\]\((?P<path>(?:" + "|".join(re.escape(d) for d in SCAN_DIRS)
+    + r")/[^)]+\.md)\))(?: — (?P<summary>.*))?$")
 
 
 def memory_index_lines():
@@ -785,6 +797,11 @@ def expected_summary(e):
         ch = e["fm"].get("channel", "").strip()
         if role and ch:
             return f"{role}／{ch}；{desc}"
+    if e["layer"] == PIPELINES:
+        kind = e["fm"].get("pipeline_kind", "").strip()
+        cad = e["fm"].get("cadence", "").strip()
+        if kind and cad:
+            return f"{kind}／{cad}；{desc}"
     return desc
 
 
@@ -1829,9 +1846,9 @@ def cmd_lint(args):
         expected = SCAN_DIRS[e["layer"]]
         if fm.get("type") and fm["type"] != expected:
             problems.append(f"{e['relpath']}：type `{fm['type']}` 與資料夾不符（應為 `{expected}`）")
-        if e["layer"] == EXPRESSIONS:
+        if e["layer"] in AXES:
             # 軸是組織鍵：管 lint、管索引分組、管矩陣看得出哪一格沒填。檢索走 description。
-            for axis, vocab in EXPRESSION_AXES.items():
+            for axis, vocab in AXES[e["layer"]].items():
                 val = fm.get(axis, "").strip()
                 if not val:
                     problems.append(f"{e['relpath']}：缺 frontmatter `{axis}`（軸定位它在哪一格）")
@@ -1869,7 +1886,8 @@ def cmd_lint(args):
         for name, n in ai_tells(mb):
             tells.setdefault(name, []).append((e["relpath"], n))
         n_chars = len(re.sub(r"\s", "", mb))
-        if n_chars > MACHINE_LAYER_CHARS_MAX:
+        # 流程的步驟本來就長，Pipelines 不量這一項
+        if n_chars > MACHINE_LAYER_CHARS_MAX and e["layer"] != PIPELINES:
             long_machine.append((e["relpath"], n_chars))
     # 外部參照要給得出名稱與連結，讀者才不用離站猜。external_reference 沒連結是缺陷；
     # 其他 origin 的條目引用了詞彙表外部術語而來由沒有連結，先提醒。
@@ -1952,8 +1970,8 @@ def cmd_lint(args):
                 continue
             ulayer = u.split("/", 1)[0]
             if e["layer"] not in rank:
-                # Expressions 不在推導鏈上，沒有「更上游的層」可比。它的 upstream 是選填的
-                # 出處標註：這個形狀是依據哪條判斷來的。只要求指進三層。
+                # Expressions 與 Pipelines 不在推導鏈上，沒有「更上游的層」可比。它們的 upstream
+                # 是選填的出處標註：這個形狀或流程是依據哪條判斷來的。只要求指進三層。
                 if ulayer not in rank:
                     problems.append(f"{e['relpath']}：upstream {u} 要指進三層")
                 continue
@@ -1985,7 +2003,7 @@ def cmd_lint(args):
             problems.append(f"GLOSSARY.md #{anchor}：缺「棧內引用」清單（沒人引用的術語該移除）")
 
     # 6. MANIFEST 指到的片段要存在。純 repo 內部檢查——機器層的接線狀態放在 doctor，
-    #    放這裡會讓「這台機器還沒接線」在 pre-commit 亮紅燈，假紅會養出 --no-verify。
+    #    放這裡會讓「本機機器還沒接線」在 pre-commit 亮紅燈，假紅會養出 --no-verify。
     manifest = read_manifest()
     if manifest:
         for r in manifest:
@@ -2077,7 +2095,7 @@ def cmd_eval(args):
     path = os.path.join(ROOT, "tools", "regression.tsv")
     cases = []
     if not os.path.exists(path):
-        print(f"這台安裝沒有回歸語料（{os.path.relpath(path, ROOT)} 不在）。eval 不適用。")
+        print(f"本機安裝沒有回歸語料（{os.path.relpath(path, ROOT)} 不在）。eval 不適用。")
         return 0
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -2231,6 +2249,8 @@ MEMORY_SKELETON = """# 決策棧索引
 ## Decisions — 由具體事件揭露出的判斷原則
 
 ## Expressions — 用詞、語氣與內容取捨：這一格該怎麼寫
+
+## Pipelines — 可帶走的工作流：觸發、輸入、步驟、輸出、需要的能力
 """
 
 # 術語是 ###，## 是分節。glossary_sections 只認 ###，範例寫成 ## 的話，照著寫的第一個術語
@@ -2537,12 +2557,18 @@ def cmd_contribute(args):
         print("    你在送改動給別人的 template：版本由對方決定，這一句忽略。")
 
     topic = args.topic or "contrib"
-    print("\n下一步自己跑。這支工具不替你推送到別人的 repo：")
-    print(f"  git checkout -b contrib/{topic}")
-    print(f"  git add {' '.join(args.paths)}")
-    print("  git commit -s        # -s 是 DCO 的 Signed-off-by，見 CONTRIBUTING")
+    # 不從這個 repo 推分支過去：分支帶著整條歷史，條目會跟著進 template。template 多半是公開的，
+    # 那一推就是外洩，而且推完才看得到。改在 template 自己的 worktree 上只放這幾個檔。
+    print("\n下一步自己跑。這支工具不替你推送到別人的 repo，也不要從這個 repo 推分支過去：")
+    print(f"  git fetch {args.remote} && git worktree add /tmp/stack-contrib {args.remote}/{args.branch}")
+    print(f"  cd /tmp/stack-contrib && git checkout -b contrib/{topic}")
+    for p in args.paths:
+        print(f"  cp {os.path.join(ROOT, p)} {p}")
+    print("  tools/stack init && tools/stack lint && tools/stack lint --shippable && tools/stack doctor --self-test")
+    print("  git add -A && git commit -s        # -s 是 DCO 的 Signed-off-by，見 CONTRIBUTING")
     print(f"  git push {args.remote} HEAD:refs/heads/contrib/{topic}")
-    print("  gh pr create -R <template repo>")
+    print("  gh pr create -R <template repo>    # 描述寫這一版換掉了哪個想法，不只列檔案")
+    print(f"  cd - && git worktree remove /tmp/stack-contrib")
     return 0
 
 
@@ -2865,6 +2891,36 @@ def doctor_pr_access_row():
             f"　→ gh auth switch 切到 {m.group(1)}")
 
 
+# 只認本機路徑：~/ 開頭，或 /Users、/home 開頭。repo 相對路徑（Frameworks/x.md）不算，那是棧內連結。
+DOWNSTREAM_PATH_RE = re.compile(r"(?<![\w./])((?:~|/Users|/home)/[^\s（）()，,、;；]+)")
+
+
+def doctor_downstream_rows(entries):
+    """每一條長得像本機路徑的 downstream：不存在 WARN，存在但沒版控 WARN，其餘合成一列 OK。"""
+    missing, unversioned, ok = [], [], 0
+    for e in entries:
+        for raw in DOWNSTREAM_PATH_RE.findall(e["fm"].get("downstream", "")):
+            path = os.path.expanduser(raw.rstrip("。.`"))
+            if not os.path.exists(path):
+                missing.append((e["stem"], raw))
+                continue
+            probe = path if os.path.isdir(path) else os.path.dirname(path)
+            top = git_out("-C", probe, "rev-parse", "--show-toplevel")
+            if top is None:
+                unversioned.append((e["stem"], raw))
+            else:
+                ok += 1
+    rows = []
+    for stem, raw in missing:
+        rows.append(("WARN", "downstream", f"{stem} 指到 {raw}，檔不在。改指向，或把那一份放回去"))
+    for stem, raw in unversioned:
+        rows.append(("WARN", "downstream", f"{stem} 指到 {raw}，那一份不在任何 git 工作樹裡"
+                                           "　→ 收進 harness repo 再用 symlink 放回原位"))
+    if ok and not missing and not unversioned:
+        rows.append(("OK", "downstream", f"{ok} 條本機路徑都存在而且有版控"))
+    return rows
+
+
 def cmd_doctor(args):
     """接線體檢：純唯讀。回報「規則有沒有真的到得了各 harness」。
 
@@ -2936,6 +2992,14 @@ def cmd_doctor(args):
                                            "（recall 會自動重嵌）"))
         except (OSError, json.JSONDecodeError):
             rows.append(("WARN", "向量索引", "壞掉，下次 recall 會整份重建"))
+
+    # 5b. downstream 指到的本機檔案：存不存在、在不在某個 git 工作樹裡。
+    #     棧裡只留一條線指向被執行的那一份，那一份沒版控的話，線指到的東西隨時會消失而且沒有訊號。
+    rows.extend(doctor_downstream_rows(entries))
+    # 5c. 流程：本機決定了哪些要跑、啟用的有沒有漂移；harness repo 新不新；綠副本開著幾個
+    rows.extend(doctor_pipelines_rows(entries))
+    rows.extend(doctor_harness_rows())
+    rows.extend(doctor_green_rows())
 
     # 6. 逐列 MANIFEST
     rows += doctor_manifest_rows(read_manifest())
@@ -3214,7 +3278,7 @@ def cmd_install(args):
             continue
         target = os.path.expanduser(r.get("target_path", ""))
         if not os.path.exists(target):
-            results.append(("SKIP", label, f"目標不存在（這台機器沒裝這個 harness）："
+            results.append(("SKIP", label, f"目標不存在（本機機器沒裝這個 harness）："
                                            f"{r.get('target_path')}"))
             continue
         if os.path.realpath(target) == os.path.realpath(
@@ -3264,6 +3328,492 @@ def cmd_install(args):
     return cmd_doctor(argparse.Namespace(quiet=False, json=False, self_test=False))
 
 
+# ---------------------------------------------------------------- 流程啟用與對帳
+
+PIPELINES_LOCAL = os.path.join(ROOT, "tools", "local", "pipelines.tsv")
+PIPELINES_LOCAL_HEADER = "stem\tenabled\tpath\treconciled"
+
+
+def harness_roots():
+    """[harness] 設定：{別名: 絕對路徑}。沒設回空 dict，接線建議表就只能給絕對路徑。"""
+    out = {}
+    for k, v in (read_config().get("harness") or {}).items():
+        if isinstance(v, str) and v.strip():
+            out[k] = os.path.expanduser(v.strip())
+    return out
+
+
+def pipelines_catalog(entries=None):
+    """棧裡的流程目錄：{stem: entry}。"""
+    entries = entries if entries is not None else load_entries()
+    return {e["stem"]: e for e in entries if e["layer"] == PIPELINES}
+
+
+def pipelines_local():
+    """本機啟用表：{stem: {"enabled","path","reconciled"}}。檔不在回空，這代表全部未決定。"""
+    out = {}
+    if not os.path.exists(PIPELINES_LOCAL):
+        return out
+    with open(PIPELINES_LOCAL, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.rstrip("\n")
+            if not line or line.startswith("#") or (i == 0 and line.startswith("stem\t")):
+                continue
+            cols = (line.split("\t") + ["", "", ""])[:4]
+            out[cols[0].strip()] = {"enabled": cols[1].strip(), "path": cols[2].strip(),
+                                    "reconciled": cols[3].strip()}
+    return out
+
+
+def pipelines_local_save(table):
+    os.makedirs(os.path.dirname(PIPELINES_LOCAL), exist_ok=True)
+    lines = [PIPELINES_LOCAL_HEADER]
+    for stem in sorted(table):
+        r = table[stem]
+        lines.append("\t".join([stem, r.get("enabled", ""), r.get("path", ""), r.get("reconciled", "")]))
+    with open(PIPELINES_LOCAL, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def pipelines_suggestions():
+    """接線建議表：個人 harness 的 pipelines.tsv，{stem: [(repo 別名, repo 相對路徑)]}。"""
+    out = {}
+    roots = harness_roots()
+    personal = roots.get("personal")
+    if not personal:
+        return out
+    p = os.path.join(personal, "pipelines.tsv")
+    if not os.path.exists(p):
+        return out
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#") or line.startswith("stem\t"):
+                continue
+            cols = line.split("\t")
+            if len(cols) < 3:
+                continue
+            for rel in cols[2].split(","):
+                out.setdefault(cols[0].strip(), []).append((cols[1].strip(), rel.strip()))
+    return out
+
+
+def pipelines_resolve_paths(stem):
+    """接線建議 → 本機絕對路徑清單。別名查不到 [harness] 就略過那一筆。"""
+    roots = harness_roots()
+    paths = []
+    for alias, rel in pipelines_suggestions().get(stem, []):
+        if alias in roots:
+            paths.append(os.path.join(roots[alias], rel))
+    return paths
+
+
+def pipelines_status(catalog, local):
+    """三種狀態分桶：未決定、啟用、停用；外加已淘汰（表裡有、目錄沒有）。"""
+    undecided = [s for s in sorted(catalog) if s not in local]
+    enabled = [s for s in sorted(catalog) if local.get(s, {}).get("enabled") == "yes"]
+    disabled = [s for s in sorted(catalog) if s in local and local[s].get("enabled") != "yes"]
+    retired = [s for s in sorted(local) if s not in catalog]
+    return undecided, enabled, disabled, retired
+
+
+def ts_key(value):
+    """把日期或 ISO 時間戳變成可比較的 UTC datetime。只有日期的當成那天 00:00，寧可多報不漏報。"""
+    import datetime
+    v = (value or "").strip()
+    if not v:
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    try:
+        d = datetime.datetime.fromisoformat(v)
+    except ValueError:
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc) if len(v) == 10 else d.astimezone()
+    return d.astimezone(datetime.timezone.utc)
+
+
+def now_stamp():
+    import datetime
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def git_last_change(path):
+    """某個路徑在它所屬 repo 的最後一次 commit 時間（ISO，到秒）。不在 repo 裡或沒有 commit 回 None。"""
+    probe = path if os.path.isdir(path) else os.path.dirname(path)
+    if not os.path.exists(probe):
+        return None
+    top = git_out("-C", probe, "rev-parse", "--show-toplevel")
+    if top is None:
+        return None
+    out = git_out("-C", top.strip(), "log", "-1", "--format=%cI", "--", os.path.relpath(path, top.strip()))
+    return (out or "").strip() or None
+
+
+def pipelines_drift(catalog, local):
+    """只看啟用的。回 (實作改了, 文檔改了, 沒路徑)，各是 [(stem, 說明)]。"""
+    impl_changed, doc_changed, no_path = [], [], []
+    for stem, r in local.items():
+        if r.get("enabled") != "yes" or stem not in catalog:
+            continue
+        rec = r.get("reconciled") or ""
+        rec_k = ts_key(rec)
+        doc_date = git_last_change(os.path.join(ROOT, catalog[stem]["relpath"]))
+        if doc_date and ts_key(doc_date) > rec_k:
+            doc_changed.append((stem, f"文檔 {doc_date[:16]} 晚於對帳 {rec[:16] or '（尚未）'}"))
+        paths = [p for p in r.get("path", "").split(",") if p.strip()]
+        if not paths:
+            no_path.append((stem, "啟用了但沒有實作路徑"))
+            continue
+        for p in paths:
+            d = git_last_change(os.path.expanduser(p.strip()))
+            if d is None:
+                no_path.append((stem, f"{p} 不存在或不在 git 裡"))
+            elif ts_key(d) > rec_k:
+                impl_changed.append((stem, f"{p} {d[:16]} 晚於對帳 {rec[:16] or '（尚未）'}"))
+    return impl_changed, doc_changed, no_path
+
+
+def cmd_pipelines_list(args):
+    catalog = pipelines_catalog(); local = pipelines_local()
+    undecided, enabled, disabled, retired = pipelines_status(catalog, local)
+    if not catalog:
+        print("目錄是空的。Pipelines/ 還沒有條目。")
+        return 0
+    if undecided:
+        print(f"未決定 {len(undecided)} 筆（本機要不要跑，還沒人說）：")
+        for s in undecided:
+            print(f"  ? {s}  {catalog[s]['fm'].get('pipeline_kind','')}／{catalog[s]['fm'].get('cadence','')}")
+        print("  → stack pipelines enable <stem> 或 disable <stem>；一次決定完：stack pipelines init\n")
+    if enabled:
+        print(f"啟用 {len(enabled)} 筆：")
+        for s in enabled:
+            r = local[s]
+            print(f"  ✓ {s}  對帳 {(r.get('reconciled') or '尚未')[:16]}  {r.get('path') or '（沒有實作路徑）'}")
+    if disabled:
+        print(f"停用 {len(disabled)} 筆：" + "、".join(disabled))
+    if retired:
+        print(f"已淘汰（啟用表有、目錄沒有）{len(retired)} 筆：" + "、".join(retired) + "　→ disable 或刪列")
+    return 1 if undecided else 0
+
+
+def cmd_pipelines_enable(args):
+    catalog = pipelines_catalog(); local = pipelines_local()
+    if args.stem not in catalog:
+        die(f"目錄裡沒有 {args.stem}。stack pipelines list 看有哪些")
+    paths = [os.path.expanduser(args.path)] if args.path else pipelines_resolve_paths(args.stem)
+    if not paths:
+        die(f"{args.stem} 查不到實作路徑。\n"
+            "  → 加 --path <本機路徑>，或在個人 harness 的 pipelines.tsv 補接線建議，"
+            "並確認 tools/stack.config.toml 有 [harness] 那一節")
+    r = local.get(args.stem, {})
+    r.update({"enabled": "yes", "path": ",".join(paths)})
+    r.setdefault("reconciled", "")
+    local[args.stem] = r
+    pipelines_local_save(local)
+    missing = [p for p in paths if not os.path.exists(p)]
+    print(f"✓ 啟用 {args.stem}　實作：{'、'.join(paths)}")
+    if missing:
+        print(f"  △ 這些路徑現在不存在：{'、'.join(missing)}。drift 會報，clone 好 harness repo 就會消")
+    if not r["reconciled"]:
+        print("  對帳日還是空的。看過文檔與實作一致之後跑 stack pipelines reconcile " + args.stem)
+    return 0
+
+
+def cmd_pipelines_disable(args):
+    local = pipelines_local()
+    r = local.get(args.stem, {})
+    r["enabled"] = "no"; r.setdefault("path", ""); r.setdefault("reconciled", "")
+    local[args.stem] = r
+    pipelines_local_save(local)
+    print(f"— 停用 {args.stem}。列留著，對帳日保留")
+    return 0
+
+
+def cmd_pipelines_init(args):
+    catalog = pipelines_catalog(); local = pipelines_local()
+    undecided, *_ = pipelines_status(catalog, local)
+    if not undecided:
+        print("沒有未決定的流程。")
+        return 0
+    if not args.yes and not sys.stdin.isatty():
+        print(f"{len(undecided)} 筆未決定，但這裡沒有終端機可以問。之後跑 stack pipelines list 逐條決定，"
+              "或 stack pipelines init --yes 照接線建議表全啟用。")
+        return 1
+    for s in undecided:
+        paths = pipelines_resolve_paths(s)
+        if args.yes:
+            ans = "y" if paths else "s"
+        else:
+            desc = catalog[s]["fm"].get("description", "")[:60]
+            hint = "、".join(paths) if paths else "（沒有接線建議，啟用後要自己給路徑）"
+            try:
+                ans = input(f"{s}：{desc}\n  實作 {hint}\n  本機要跑嗎？ [y]啟用 [n]停用 [s]略過 › ").strip().lower()
+            except EOFError:
+                ans = "s"
+        if ans == "y":
+            local[s] = {"enabled": "yes", "path": ",".join(paths), "reconciled": ""}
+            print(f"  ✓ 啟用 {s}" + ("" if paths else "　（路徑待補：stack pipelines enable --path）"))
+        elif ans == "n":
+            local[s] = {"enabled": "no", "path": "", "reconciled": ""}
+            print(f"  — 停用 {s}")
+        else:
+            print(f"  · 略過 {s}，維持未決定")
+    pipelines_local_save(local)
+    return 0
+
+
+def cmd_pipelines_drift(args):
+    catalog = pipelines_catalog(); local = pipelines_local()
+    undecided, enabled, _, retired = pipelines_status(catalog, local)
+    impl, doc, nopath = pipelines_drift(catalog, local)
+    if not enabled:
+        print("沒有啟用的流程，沒有東西可對帳。stack pipelines list")
+        return 1 if (undecided or retired) else 0
+    for title, rows in (("實作改了，文檔沒跟", impl), ("文檔改了，實作沒跟", doc), ("沒有可對的實作", nopath)):
+        if rows:
+            print(f"{title}：{len(rows)} 筆")
+            for s, why in rows:
+                print(f"  ✗ {s}：{why}")
+    if retired:
+        print(f"已淘汰：{'、'.join(retired)}")
+    if undecided:
+        print(f"未決定 {len(undecided)} 筆（不在對帳範圍）：{'、'.join(undecided)}")
+    if not (impl or doc or nopath or retired):
+        print(f"啟用的 {len(enabled)} 筆都跟文檔對得上。")
+        return 0
+    print("\n對過之後：stack pipelines reconcile <stem>。改了什麼想法寫進文檔的來由。")
+    return 1
+
+
+def cmd_pipelines_reconcile(args):
+    local = pipelines_local()
+    if args.stem not in local or local[args.stem].get("enabled") != "yes":
+        die(f"{args.stem} 不在本機的啟用表裡，先 stack pipelines enable")
+    local[args.stem]["reconciled"] = now_stamp()
+    pipelines_local_save(local)
+    print(f"✓ {args.stem} 對帳日改成今天。改了什麼想法，寫進 Pipelines/{args.stem}.md 的來由")
+    return 0
+
+
+def doctor_pipelines_rows(entries):
+    """doctor 的 pipelines 列：未決定不為零就 WARN，那是「新流程出現了，本機還沒決定」的提示。"""
+    catalog = pipelines_catalog(entries)
+    if not catalog:
+        return []
+    local = pipelines_local()
+    undecided, enabled, disabled, retired = pipelines_status(catalog, local)
+    impl, doc, nopath = pipelines_drift(catalog, local)
+    detail = (f"未決定 {len(undecided)}　啟用 {len(enabled)}（實作改了 {len(impl)}、文檔改了 {len(doc)}、"
+              f"沒實作 {len(nopath)}）　停用 {len(disabled)}　已淘汰 {len(retired)}")
+    level = "WARN" if (undecided or impl or doc or nopath or retired) else "OK"
+    hint = ""
+    if undecided:
+        hint = "　→ stack pipelines init 決定本機要跑哪些"
+    elif impl or doc or nopath:
+        hint = "　→ stack pipelines drift 看哪幾筆"
+    elif retired:
+        hint = "　→ 啟用表裡有目錄已經沒有的 stem，disable 或刪列"
+    return [(level, "pipelines", detail + hint)]
+
+
+def doctor_harness_rows():
+    """[harness] 列的每個 repo：在不在、乾不乾淨、落後遠端幾個。跨裝置「拿到的是不是最新」靠這一列。"""
+    rows = []
+    for alias, root in sorted(harness_roots().items()):
+        if not os.path.isdir(root):
+            rows.append(("WARN", "harness repo", f"{alias}：{root} 不存在　→ 跑該 repo 的 bootstrap，或改 [harness]"))
+            continue
+        if git_out("-C", root, "rev-parse", "--show-toplevel") is None:
+            rows.append(("WARN", "harness repo", f"{alias}：{root} 不是 git repo"))
+            continue
+        dirty = (git_out("-C", root, "status", "--porcelain") or "").strip()
+        upstream = (git_out("-C", root, "rev-parse", "--abbrev-ref", "@{upstream}") or "").strip()
+        behind = ""
+        if upstream:
+            cnt = (git_out("-C", root, "rev-list", "--count", f"HEAD..{upstream}") or "").strip()
+            behind = f"落後 {cnt}" if cnt and cnt != "0" else "與遠端同步"
+        else:
+            behind = "沒有遠端"
+        state = ("工作區有未提交改動" if dirty else "工作區乾淨") + "、" + behind
+        level = "WARN" if (dirty or behind.startswith("落後")) else "OK"
+        rows.append((level, "harness repo", f"{alias}：{state}"))
+    return rows
+
+
+def doctor_green_rows():
+    """~/.claude 底下的 *-green 連結：綠副本開著幾個、指到哪、開了幾天。開超過一週提醒。"""
+    import time
+    rows = []
+    found = []
+    for base in (os.path.join(CLAUDE_DIR, "skills"), os.path.join(CLAUDE_DIR, "scheduled-tasks")):
+        if not os.path.isdir(base):
+            continue
+        for fn in sorted(os.listdir(base)):
+            p = os.path.join(base, fn)
+            if fn.endswith("-green") and os.path.islink(p):
+                age = int((time.time() - os.lstat(p).st_mtime) // 86400)
+                found.append((os.path.basename(base), fn, os.path.realpath(p), age))
+    if not found:
+        return rows
+    old = [f for f in found if f[3] >= 7]
+    detail = "；".join(f"{b}/{n} → {t}（{a} 天）" for b, n, t, a in found)
+    rows.append(("WARN" if old else "INFO", "green", f"{len(found)} 個綠副本：{detail}"
+                 + ("　→ 開超過一週了，升或撤" if old else "")))
+    return rows
+
+
+# ---------------------------------------------------------------- 決策日誌
+
+def journal_root():
+    """[journal] path。沒設就 die 並說怎麼設。日誌是事件不是原則，住在棧外自己的 repo。"""
+    path = str((read_config().get("journal") or {}).get("path", "") or "").strip()
+    if not path:
+        die("本機沒設決策日誌的位置。\n"
+            "  → 在 tools/stack.config.toml 加：\n"
+            "    [journal]\n"
+            "    path = \"~/Personal/decision-journal\"\n"
+            "  日誌是一個獨立的私有 repo，格式見 templates/journal-entry.md 與 skills/decision-journal")
+    root = os.path.expanduser(path)
+    if not os.path.isdir(root):
+        die(f"決策日誌目錄不存在：{root}\n  → git init 它，或改 [journal] path")
+    return root
+
+
+def journal_entries(root):
+    """[(路徑, frontmatter dict, body)]，依檔名排序。"""
+    out = []
+    for dirpath, _, files in os.walk(root):
+        if "/.git" in dirpath:
+            continue
+        for fn in sorted(files):
+            if not fn.endswith(".md") or fn.upper() == "README.MD":
+                continue
+            p = os.path.join(dirpath, fn)
+            fm, body = parse_frontmatter(open(p, encoding="utf-8").read())
+            if fm.get("type") == "journal":
+                out.append((p, fm, body))
+    return sorted(out)
+
+
+def journal_slug(text):
+    s = re.sub(r"[^\w\u4e00-\u9fff]+", "-", text.strip()).strip("-")
+    return s[:24] or "decision"
+
+
+def cmd_journal_new(args):
+    import datetime
+    root = journal_root()
+    today = datetime.date.today()
+    review_on = args.review_on or (today + datetime.timedelta(days=args.days)).isoformat()
+    # 留痕：跑一次 recall，拿最後那行。這行證明判斷有依據，也讓回看時查得到用了哪幾筆
+    trace = "（recall 失敗，沒有留痕）"
+    r = subprocess.run([sys.executable, os.path.realpath(__file__), "recall", args.decision,
+                        "-q", "--no-branches", "-k", "3"], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith("決策棧檢索："):
+            trace = line.strip()
+    tpl_path = os.path.join(ROOT, "templates", "journal-entry.md")
+    tpl = open(tpl_path, encoding="utf-8").read() if os.path.exists(tpl_path) else JOURNAL_FALLBACK
+    text = (tpl.replace("<決定>", args.decision).replace("<YYYY-MM-DD>", today.isoformat())
+               .replace("<回看日>", review_on).replace("<留痕行>", trace)
+               .replace("<公司 | 個人 | 生活>", args.domain))
+    sub = os.path.join(root, today.strftime("%Y"), today.strftime("%m"))
+    os.makedirs(sub, exist_ok=True)
+    path = os.path.join(sub, f"{today.isoformat()}-{journal_slug(args.slug or args.decision)}.md")
+    if os.path.exists(path):
+        die(f"已經有 {path}，換個 --slug")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"✓ {path}")
+    print(f"  留痕：{trace}")
+    print(f"  任務系統指標建議：「回看：{args.decision[:30]}」，到期日 {review_on}，內容只放這個路徑")
+    print("  接著把預測、信心、算錯的條件填完。五欄缺一就先別存，缺的那一欄代表決定還沒成形")
+    return 0
+
+
+def cmd_journal_due(args):
+    import datetime
+    root = journal_root()
+    limit = (datetime.date.today() + datetime.timedelta(days=args.days)).isoformat()
+    due = [(p, fm) for p, fm, _ in journal_entries(root)
+           if fm.get("status", "open") == "open" and str(fm.get("review_on", "9999")) <= limit]
+    if not due:
+        print("沒有到期要回看的日誌。")
+        return 0
+    print(f"{len(due)} 筆到期（含 {args.days} 天內）：")
+    for p, fm in due:
+        print(f"  {fm.get('review_on', '?')}  {fm.get('domain', '?')}  {fm.get('decision', '')[:40]}")
+        print(f"      {os.path.relpath(p, root)}")
+    print("\n回看：stack journal review <檔>。先讀日誌，再看結果。")
+    return 0
+
+
+def cmd_journal_review(args):
+    root = journal_root()
+    path = args.entry if os.path.isabs(args.entry) else os.path.join(root, args.entry)
+    if not os.path.exists(path):
+        hits = [p for p, _, _ in journal_entries(root) if p.endswith(args.entry)]
+        if len(hits) != 1:
+            die(f"找不到日誌 {args.entry}（{len(hits)} 個候選）")
+        path = hits[0]
+    text = open(path, encoding="utf-8").read()
+    if "## 回看" in text:
+        die(f"{path} 已經有回看區塊")
+    import datetime
+    block = (f"\n## 回看\n\n回看日 {datetime.date.today().isoformat()}\n\n"
+             "結果      <實際發生什麼>\n"
+             "對答案    <結果落在預測的哪一邊；「算錯的條件」成立了沒>\n"
+             "落點      <外部 ｜ 認知（策略 ｜ 人員組成 ｜ 執行）>\n"
+             "下一步    <更新機率 ｜ 寫入棧：<條目名> ｜ 運氣，判斷留著>\n")
+    text = re.sub(r"^status: open$", "status: reviewed", text, count=1, flags=re.M)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.rstrip("\n") + "\n" + block)
+    print(f"✓ 補上回看區塊：{path}")
+    print("  先讀日誌再看結果；落在認知的那一層依寫入程序寫進棧，寫完把條目名填進「下一步」")
+    return 0
+
+
+def cmd_journal_stats(args):
+    root = journal_root()
+    es = journal_entries(root)
+    opened = sum(1 for _, fm, _ in es if fm.get("status", "open") == "open")
+    reviewed = [(fm, body) for _, fm, body in es if fm.get("status") == "reviewed"]
+    to_stack = sum(1 for _, body in reviewed if re.search(r"寫入棧[：:]\s*[A-Za-z]", body))
+    # 佔位符裡也有「運氣」兩個字，只數填過的那一行
+    luck = sum(1 for _, body in reviewed
+               if re.search(r"^下一步\s+(?!<).*運氣", section_body(body, "回看"), re.M))
+    by_dom = {}
+    for _, fm, _ in es:
+        by_dom[fm.get("domain", "?")] = by_dom.get(fm.get("domain", "?"), 0) + 1
+    print(f"日誌 {len(es)} 筆：open {opened}、已回看 {len(reviewed)}"
+          f"（寫進棧 {to_stack}、判為運氣 {luck}）")
+    print("  依場域：" + "、".join(f"{k} {v}" for k, v in sorted(by_dom.items())))
+    return 0
+
+
+JOURNAL_FALLBACK = """---
+type: journal
+decision: <決定>
+domain: <公司 | 個人 | 生活>
+date: <YYYY-MM-DD>
+review_on: <回看日>
+status: open
+---
+
+## 預測
+
+<會發生什麼>，信心 <百分比>
+
+## 依據
+
+<留痕行>
+
+## 算錯的條件
+
+<結果長成什麼樣就承認錯>
+"""
+
+
 def cmd_setup(args):
     """一路跑完換機器或開新棧要做的事。每一步沿用各自的「已存在不覆蓋」，重跑一次全部是 OK。
 
@@ -3297,6 +3847,11 @@ def cmd_setup(args):
     else:
         ensure_index(entries, force=False, verbose=True)
         print(f"  ✓ {len(entries)} 筆都在索引裡")
+
+    if any(e["layer"] == PIPELINES for e in entries) and not os.path.exists(PIPELINES_LOCAL):
+        print("\n=== 3b/4 流程啟用 ===")
+        print("  目錄裡有流程，本機還沒決定要跑哪些：")
+        cmd_pipelines_init(argparse.Namespace(yes=False))
 
     print("\n=== 4/4 接線 ===")
     if args.skip_install:
@@ -3377,6 +3932,38 @@ def main():
 
     ini = sub.add_parser("init", help="建立一個新的決策棧。已存在的檔案不覆蓋")
     ini.set_defaults(func=cmd_init)
+
+    pl = sub.add_parser("pipelines", help="流程啟用與對帳：list／enable／disable／init／drift／reconcile")
+    plsub = pl.add_subparsers(dest="pcmd", required=True)
+    plsub.add_parser("list", help="目錄逐條印本機的狀態：未決定、啟用、停用、已淘汰").set_defaults(func=cmd_pipelines_list)
+    pe = plsub.add_parser("enable", help="本機要跑這條；沒給 --path 就查接線建議表")
+    pe.add_argument("stem"); pe.add_argument("--path", help="本機實作路徑，逗號分隔可多筆")
+    pe.set_defaults(func=cmd_pipelines_enable)
+    pd = plsub.add_parser("disable", help="本機不跑這條，列留著"); pd.add_argument("stem")
+    pd.set_defaults(func=cmd_pipelines_disable)
+    pi = plsub.add_parser("init", help="逐條問未決定的；--yes 照接線建議表全啟用")
+    pi.add_argument("--yes", action="store_true"); pi.set_defaults(func=cmd_pipelines_init)
+    plsub.add_parser("drift", help="啟用的：實作改了文檔沒跟、文檔改了實作沒跟、沒有可對的實作").set_defaults(func=cmd_pipelines_drift)
+    pr_ = plsub.add_parser("reconcile", help="看過一致之後把本機的對帳日改成今天"); pr_.add_argument("stem")
+    pr_.set_defaults(func=cmd_pipelines_reconcile)
+
+    jo = sub.add_parser("journal", help="決策日誌：new 寫一筆、due 列到期、review 補回看、stats 統計")
+    josub = jo.add_subparsers(dest="jcmd", required=True)
+    jn = josub.add_parser("new", help="下決定的當下寫一筆，自動跑 recall 留痕")
+    jn.add_argument("decision", help="一句話，做什麼決定")
+    jn.add_argument("--domain", choices=["公司", "個人", "生活"], default="公司")
+    jn.add_argument("--days", type=int, default=90, help="幾天後回看（預設 90）")
+    jn.add_argument("--review-on", help="指定回看日 YYYY-MM-DD，蓋過 --days")
+    jn.add_argument("--slug", help="檔名用的短字串；沒給就從決定那句切")
+    jn.set_defaults(func=cmd_journal_new)
+    jd = josub.add_parser("due", help="列回看日到了、還沒回看的")
+    jd.add_argument("--days", type=int, default=0, help="往後看幾天（預設只到今天）")
+    jd.set_defaults(func=cmd_journal_due)
+    jr = josub.add_parser("review", help="在一筆日誌尾端補回看區塊，狀態改成 reviewed")
+    jr.add_argument("entry", help="日誌檔路徑，或檔名尾端")
+    jr.set_defaults(func=cmd_journal_review)
+    js = josub.add_parser("stats", help="open、已回看、寫進棧、判為運氣各幾筆")
+    js.set_defaults(func=cmd_journal_stats)
 
     su = sub.add_parser("setup", help="一路跑完：init → Ollama → 索引 → install → doctor。重跑無害")
     su.add_argument("--yes", action="store_true", help="真的寫入各 harness 的接線；沒有它 install 只列計畫")

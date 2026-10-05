@@ -31,18 +31,29 @@
 | `Frameworks/` | 思考與作業骨架 | 怎麼下判斷 |
 | `Decisions/` | 由事件揭露的原則 | 這次該怎麼做 |
 
-另有 `Expressions/` 放一格產出該用什麼詞、什麼語氣、放哪些內容，照你本人的講法寫。
-它不是第四層，不在推導鏈上。
+另有兩個目錄，都不是第四層、不在推導鏈上：`Expressions/` 放一格產出該用什麼詞、什麼語氣、
+放哪些內容；`Pipelines/` 放一類事怎麼跑，觸發到產出，工具中立，換場域時拿「需要的能力」對當下的
+工具重建。
 
 ## 快速開始
 
 ```bash
 git clone <這個 repo> my-stack && cd my-stack
+tools/stack setup --yes --pull
+stack pipelines list                   # 目錄裡有流程時，決定本機要跑哪些
+```
+
+`setup` 一路跑完四步：建目錄與索引骨架、確認 Ollama 與嵌入模型（`--pull` 才代拉，沒有它只提示）、
+建向量索引、依清單接進各 harness（`--yes` 才寫入，沒有它只列計畫）。結尾自動跑 `doctor`。
+重跑一次全部是 OK，已存在的檔案一律不覆蓋。
+
+要逐步看的話，四步各自是一支指令：
+
+```bash
+tools/stack init                       # 目錄、MEMORY.md、Profile/、tools/local/。已存在不覆蓋
 ollama pull bge-m3                     # 嵌入模型，recall 要用
-tools/stack init                       # 建目錄與索引。已存在的檔案一律不覆蓋
+tools/stack index                      # 向量索引。純衍生物，不進版控
 tools/stack install --yes              # 接線、建 PATH 上的 stack shim、設 hooksPath
-cp -r tools/local.example tools/local  # 本機區。沒有它 doctor 每一列都停在「還沒驗過」
-tools/stack index                      # 建向量索引。純衍生物，不進版控
 stack doctor                           # 看接線與缺什麼
 ```
 
@@ -66,7 +77,20 @@ stack eval                # 對你自己寫的題目跑檢索回歸，跟基線�
 stack usage               # 哪些條目從來沒被任何情境需要
 stack prose <檔案>        # 量任意一段文字的句子形狀，對照棧內條目
 stack tree                # 推導鏈的格狀結構與孤兒
+stack migrate             # 分節順序升級時把條目搬成新順序，只搬節不改句子
+stack memory --sync       # 索引行摘要跟著 description 走，不手寫第二份
+stack skeleton <條目>     # 印可以整段複製的骨架，不另開模板目錄
+stack pipelines list      # 流程目錄在本機的狀態；enable／disable／init 決定，drift 看誰改了沒跟
+stack journal new "<決定>"  # 決策日誌，住在棧外自己的私有 repo；due 列到期、review 補回看
 ```
+
+三個隨附的工作流，都在 `skills/`，接進 harness 之後用一句話就能叫：
+
+| skill | 什麼時候 | 它做什麼 |
+|---|---|---|
+| `decision-stack-bootstrap` | 棧是空的 | 從既有素材反向萃取第一批條目 |
+| `decision-journal` | 每個結果會揭曉的判斷 | 下決定時寫日誌，到期回看、拆層、該寫入的寫入棧 |
+| `decision-stack-curation` | 每月，或單層明顯累積 | 機械訊號、逐條五問、升降級與淘汰 |
 
 以下四件事由程式檢查，不靠人記得：
 
@@ -97,7 +121,7 @@ stack tree                # 推導鏈的格狀結構與孤兒
 ## 不做的事
 
 不引入任何 pip 依賴。不送任何內容到外部服務。工具只產候選與報告，拆分、合併、改寫全部人工
-定案。完整清單在 `tools/stack` 開頭的模組說明裡。
+定案。不在主工作樹上改工具：開 worktree 驗過再合併，shim 指的是 repo，切分支就是切版本。完整清單在 `tools/stack` 開頭的模組說明裡。
 
 ## 往下讀
 
