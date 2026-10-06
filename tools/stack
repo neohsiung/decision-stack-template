@@ -210,6 +210,8 @@ EMBED_MODEL = os.environ.get("STACK_EMBED_MODEL", "bge-m3")
 # 純 CPU 跑 bge-m3 實測約 20–25 秒/視角，一批 24 個視角就會超過 300 秒——逾時要蓋得住
 # 最慢的機器，否則「機器慢」會被誤讀成「服務掛了」。
 EMBED_TIMEOUT = int(os.environ.get("STACK_EMBED_TIMEOUT", "900"))
+# lint --wording 用的本機判讀模型。AI_TELLS 只抓被糾正過的詞，表外的要靠讀過一遍；用本機模型讀，提醒不擋。
+WORDING_MODEL_DEFAULT = "qwen2.5:7b-instruct"
 
 REQUIRED_FIELDS = ("name", "description", "type", "origin", "recorded")
 MIN_VIEW_CHARS = 20
@@ -623,6 +625,57 @@ def git_out(*args):
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
+
+
+def github_account():
+    """[github] account：個人 GitHub 帳號。沒設回空字串。"""
+    return str((read_config().get("github") or {}).get("account") or "").strip()
+
+
+_GH_ENV = None
+
+
+def gh_env():
+    """gh 的環境：一律帶 [github] account 的 token。
+
+    作用中的 gh 帳號常常是別的（工作 repo 用得多），而個人 repo 在那個帳號底下解析不到，錯誤訊息
+    長得像 repo 不存在。切全域帳號會影響同一台機器上其他工作，所以單次帶 token，不切。
+    沒設帳號、或 gh 給不出 token，就照 gh 現狀。
+    """
+    global _GH_ENV
+    if _GH_ENV is not None:
+        return _GH_ENV
+    env = dict(os.environ)
+    acct = github_account()
+    if acct and not env.get("GH_TOKEN"):
+        try:
+            r = subprocess.run(["gh", "auth", "token", "-u", acct],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                env["GH_TOKEN"] = r.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _GH_ENV = env
+    return env
+
+
+def gh_out(*args, timeout=20):
+    """跑 gh，回 (stdout 或 None, stderr)。找不到 gh、逾時都回 None，說明在第二個值。"""
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True,
+                           timeout=timeout, env=gh_env())
+    except FileNotFoundError:
+        return None, "找不到 gh"
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    return (r.stdout if r.returncode == 0 else None), (r.stderr or "").strip()
+
+
+def origin_slug():
+    """origin 的 GitHub owner/repo；不是 GitHub 回 (None, url)。"""
+    url = (git_out("remote", "get-url", "origin") or "").strip()
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    return (f"{m.group(1)}/{m.group(2)}" if m else None), url
 
 
 # recall 讀工作目錄，lint／tree／eval 量工作目錄。工作目錄飄掉的時候這幾個數字
@@ -1791,6 +1844,97 @@ FIX_HINTS = [
 ]
 
 
+WORDING_PROMPT = (
+    "你是台灣的中文編輯。下面是一段繁體中文的規則文字，讀者是台灣人。只找三類問題：\n"
+    "1. 非台灣講法：中國大陸用語或直譯詞，例如「拍板」「打造」「賦能」「視頻」「質量（指品質時）」。\n"
+    "2. AI 套語與翻譯腔：刪掉不損失資訊的詞，例如「值得注意的是」「本質上」「某種程度上」「進行討論」。\n"
+    "3. 文言或成語堆疊：口語講得清楚卻換成書面套語的句子。\n"
+    "不改意思，不評論內容對錯，不挑術語（閘門、骨架、條目、上游是這裡的固定用語）。\n"
+    "只列你很確定的；拿不準就不列，寧可少列。每一項給原文片段、類型、改法。沒有問題就回空陣列。"
+    "只輸出 JSON：{\"items\":[{\"原文\":\"...\",\"類型\":\"非台灣講法|套語|文言\",\"改成\":\"...\"}]}"
+)
+
+
+def wording_model():
+    return (os.environ.get("STACK_WORDING_MODEL")
+            or str((read_config().get("wording") or {}).get("model") or "").strip()
+            or WORDING_MODEL_DEFAULT)
+
+
+def wording_review(text, model):
+    """請本機模型讀一段機器層文字，回 (items, 錯誤說明)。"""
+    payload = json.dumps({
+        "model": model, "stream": False, "format": "json",
+        "options": {"temperature": 0},
+        "messages": [{"role": "system", "content": WORDING_PROMPT},
+                     {"role": "user", "content": text}],
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        data = json.load(urllib.request.urlopen(req, timeout=180))
+        content = (data.get("message") or {}).get("content") or "{}"
+        items = json.loads(content).get("items") or []
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, AttributeError) as e:
+        return None, str(e)[:120]
+    out = []
+    for it in items:
+        if isinstance(it, dict) and it.get("原文"):
+            out.append((str(it.get("原文"))[:60], str(it.get("類型") or "?"), str(it.get("改成") or "")[:60]))
+    return out, ""
+
+
+def wording_targets(paths):
+    """沒給路徑就拿相對 main 改過或新增的條目。"""
+    if paths:
+        return [os.path.relpath(os.path.abspath(p), ROOT) for p in paths]
+    changed = (git_out("diff", "--name-only", "main", "--", *SCAN_DIRS) or "").split()
+    untracked = (git_out("ls-files", "--others", "--exclude-standard", "--", *SCAN_DIRS) or "").split()
+    return sorted({p for p in changed + untracked if p.endswith(".md") and os.path.exists(os.path.join(ROOT, p))})
+
+
+def cmd_lint_wording(paths):
+    """用本機模型讀機器層，列非台灣講法、套語、文言。提醒不擋，永遠回 0。"""
+    model = wording_model()
+    status, why = ollama_status()
+    if status == "down":
+        print(f"✗ {why}。lint --wording 需要本機 Ollama。")
+        return 0
+    try:
+        tags = json.load(urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5))
+        names = [m.get("name", "") for m in tags.get("models", [])]
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        names = []
+    if not any(n == model or n.split(":")[0] == model.split(":")[0] for n in names):
+        print(f"✗ 本機沒有判讀模型 {model}　→ ollama pull {model}，或在 tools/stack.config.toml 設 [wording] model")
+        return 0
+    targets = wording_targets(paths)
+    if not targets:
+        print("沒有相對 main 改動的條目。給路徑：stack lint --wording <檔>")
+        return 0
+    total = 0
+    for rel in targets:
+        with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+            raw = f.read()
+        body = re.sub(r"^---.*?---\s*", "", raw, count=1, flags=re.S)
+        text = re.sub(r"```.*?```", "", machine_body(body), flags=re.S).strip()
+        if not text:
+            continue
+        items, err = wording_review(text, model)
+        if items is None:
+            print(f"  ✗ {rel}：模型讀不了（{err}）")
+            continue
+        if not items:
+            print(f"  ✓ {rel}：沒挑出東西")
+            continue
+        total += len(items)
+        print(f"  △ {rel}：{len(items)} 處")
+        for src, kind, fix in items:
+            print(f"      「{src}」 {kind} → {fix}")
+    print(f"\n用詞提醒 {total} 處，{len(targets)} 檔，模型 {model}。這是提醒不是缺陷：被糾正過的詞才進 AI_TELLS。")
+    return 0
+
+
 def cmd_lint_shippable():
     fails, warns = shippable_scan()
     by_file = {}
@@ -1811,6 +1955,8 @@ def cmd_lint_shippable():
 
 
 def cmd_lint(args):
+    if getattr(args, "wording", False):
+        return cmd_lint_wording(getattr(args, "paths", None) or [])
     if getattr(args, "shippable", False):
         return cmd_lint_shippable()
     entries = load_entries()
@@ -2866,31 +3012,118 @@ def doctor_manifest_rows(manifest):
 
 
 def doctor_pr_access_row():
-    """檢查 gh 目前的帳號能不能存取 origin repo。回傳一列 (level, 標籤, 說明)。"""
-    url = (git_out("remote", "get-url", "origin") or "").strip()
-    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
-    if not m:
+    """gh 看不看得到 origin repo。工具每次呼叫 gh 都帶 [github] account 的 token，這列驗的是那條路。"""
+    slug, url = origin_slug()
+    if not slug:
         return ("INFO", "PR 存取", f"origin 不是 GitHub（{url or '未設'}），略過")
-    slug = f"{m.group(1)}/{m.group(2)}"
-    try:
-        r = subprocess.run(["gh", "repo", "view", slug, "--json", "name"],
-                           capture_output=True, text=True, timeout=15)
-    except FileNotFoundError:
+    acct = github_account()
+    out, err = gh_out("repo", "view", slug, "--json", "name", timeout=15)
+    if out is not None:
+        return ("OK", "PR 存取", f"gh 看得到 {slug}" + (f"（帶 {acct} 的 token）" if acct else ""))
+    if err == "找不到 gh":
         return ("WARN", "PR 存取", "找不到 gh　→ 分支推得上去但開不了 PR")
-    except (OSError, subprocess.SubprocessError) as e:
-        return ("WARN", "PR 存取", f"gh 執行失敗（{e}）")
-    if r.returncode == 0:
-        return ("OK", "PR 存取", f"gh 看得到 {slug}")
-    who = ""
-    try:
-        st = subprocess.run(["gh", "api", "user", "--jq", ".login"],
-                            capture_output=True, text=True, timeout=15)
-        who = st.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
+    if not acct:
+        return ("FAIL", "PR 存取",
+                f"gh 作用中的帳號看不到 {slug}，step 7 的 PR 會開不成"
+                f"　→ 在 tools/stack.config.toml 設 [github] account = <個人帳號>，工具會自己帶 token，不切全域帳號")
     return ("FAIL", "PR 存取",
-            f"gh 目前帳號（{who or '?'}）看不到 {slug}，step 7 的 PR 會開不成"
-            f"　→ gh auth switch 切到 {m.group(1)}")
+            f"{acct} 的 token 也看不到 {slug}（{err[:80]}）　→ gh auth login -u {acct}，或檢查 [github] account")
+
+
+def doctor_merged_rows(days=30):
+    """近 N 天已合併的 PR，合併 commit 要是 main 的祖先。
+
+    疊起來的 PR 合進 base 分支時 GitHub 一樣標 MERGED，main 什麼都沒拿到，而且沒有任何訊號；
+    一條原則可以這樣消失好幾天。這一列是唯一能事後看出來的欄位。
+    """
+    import datetime
+    slug, _ = origin_slug()
+    if not slug:
+        return []
+    out, err = gh_out("pr", "list", "-R", slug, "--state", "merged", "--limit", "100",
+                      "--json", "number,mergeCommit,mergedAt,baseRefName,headRefOid")
+    if out is None:
+        return [("WARN", "合併入 main", f"查不到已合併的 PR（{err[:80] or '無說明'}）")]
+    try:
+        prs = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        return [("WARN", "合併入 main", "gh 回的不是 JSON")]
+    trunk = "origin/main" if git_out("rev-parse", "--verify", "-q", "origin/main") is not None else "main"
+    since = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
+    # main 的歷史裡以訊息認得出的 PR 號：GitHub 的合併 commit 叫「Merge pull request #N」，squash 叫「標題 (#N)」。
+    # 先認訊息，因為 main 被改寫過（rebase、filter）之後 SHA 全換、訊息不換。
+    subjects = git_out("log", trunk, f"--since={days * 2} days ago", "--format=%s") or ""
+    in_trunk = set(int(n) for n in re.findall(r"Merge pull request #(\d+) ", subjects))
+    in_trunk |= set(int(n) for n in re.findall(r"\(#(\d+)\)\s*$", subjects, re.M))
+    lost, unknown, seen = [], [], 0
+    for pr in prs:
+        if (pr.get("mergedAt") or "") < since:
+            continue
+        oid = (pr.get("mergeCommit") or {}).get("oid")
+        if not oid:
+            continue
+        seen += 1
+        base = pr.get("baseRefName") or "?"
+        if pr["number"] in in_trunk or base == trunk.split("/")[-1]:
+            continue  # base 是 main 的 PR，合了就在 main，歷史改寫也不影響
+        # base 不是 main：內容只有在 base 之後又併進 main 時才到。看 SHA：合併 commit 或 head commit
+        # 任一是 main 的祖先就算到了；兩個 commit 本機都沒有（分支已刪）就說不準。
+        head = pr.get("headRefOid") or ""
+        have_oid = git_out("cat-file", "-e", oid) is not None
+        have_head = bool(head) and git_out("cat-file", "-e", head) is not None
+        if not have_oid and not have_head:
+            unknown.append((pr["number"], base))
+        elif (have_oid and git_out("merge-base", "--is-ancestor", oid, trunk) is not None) or \
+                (have_head and git_out("merge-base", "--is-ancestor", head, trunk) is not None):
+            continue
+        else:
+            lost.append((pr["number"], base))
+    if lost:
+        detail = "、".join(f"#{n}（base {b}）" for n, b in lost)
+        return [("FAIL", "合併入 main",
+                 f"已合併但不在 {trunk}：{detail}　→ 內容卡在 base 分支上，從那條分支開 PR 到 main，或 cherry-pick")]
+    if unknown:
+        detail = "、".join(f"#{n}（base {b}）" for n, b in unknown[:4])
+        return [("WARN", "合併入 main",
+                 f"{len(unknown)} 個 PR 合進的不是 main，而本機沒有它們的 commit，說不準到了沒：{detail}"
+                 f"　→ 開 PR 頁看 base 分支後來有沒有併進 main")]
+    return [("OK", "合併入 main", f"近 {days} 天 {seen} 個已合併 PR 都在 {trunk}")]
+
+
+def doctor_origin_row():
+    """origin 走得通嗎，而且走的是哪個身分。SSH 逾時與鑰匙圈拿到別的帳號，錯誤訊息都不像身分問題。"""
+    slug, url = origin_slug()
+    if not slug:
+        return ("INFO", "origin 連線", f"origin 不是 GitHub（{url or '未設'}），略過")
+    acct = github_account()
+    if url.startswith("git@") or url.startswith("ssh://"):
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-T", "git@github.com"],
+                               capture_output=True, text=True, timeout=12)
+            msg = (r.stderr or r.stdout or "").strip()
+        except FileNotFoundError:
+            return ("WARN", "origin 連線", "找不到 ssh")
+        except subprocess.TimeoutExpired:
+            msg = ""
+        except (OSError, subprocess.SubprocessError) as e:
+            msg = str(e)
+        m = re.search(r"Hi ([^!]+)!", msg)
+        if m:
+            who = m.group(1)
+            if acct and who != acct:
+                return ("WARN", "origin 連線", f"SSH 通，但金鑰屬於 {who}，不是 {acct}　→ 換 ~/.ssh/config 的金鑰，或改走 HTTPS")
+            return ("OK", "origin 連線", f"SSH 通（{who}）")
+        fix = f"git remote set-url origin https://github.com/{slug}.git" + (f" && git config credential.username {acct}" if acct else "")
+        return ("FAIL", "origin 連線", f"SSH 連不上 github.com（{msg[:60] or '逾時'}）　→ 改走 HTTPS：{fix}")
+    cu = (git_out("config", "--get", "credential.username") or "").strip()
+    if not acct:
+        return ("INFO", "origin 連線", "HTTPS；沒設 [github] account，不比對身分")
+    if cu == acct:
+        return ("OK", "origin 連線", f"HTTPS，credential.username = {acct}")
+    if not cu:
+        return ("WARN", "origin 連線",
+                f"HTTPS 沒設 credential.username，鑰匙圈會拿別的帳號、錯誤長得像 repo 不存在　→ git config credential.username {acct}")
+    return ("WARN", "origin 連線", f"HTTPS 的 credential.username 是 {cu}，不是 {acct}　→ git config credential.username {acct}")
 
 
 # 只認本機路徑：~/ 開頭，或 /Users、/home 開頭。repo 相對路徑（Frameworks/x.md）不算，那是棧內連結。
@@ -2955,6 +3188,8 @@ def cmd_doctor(args):
     # 1b. 審查閘門：分支推得上去不代表 PR 開得成。gh 目前登入的帳號看不到 origin 時，
     # 寫入程序 step 7 只會在 gh pr create 印一行錯誤，分支就停在遠端沒有審查請求。
     rows.append(doctor_pr_access_row())
+    rows.append(doctor_origin_row())
+    rows.extend(doctor_merged_rows())
 
     # 2. pre-commit 閘門（hook 本體跟著 repo 走，hooksPath 是本機設定）
     hooks_path = (git_out("config", "core.hooksPath") or "").strip()
@@ -3961,6 +4196,9 @@ def main():
                    help="寫作契約 v2 的三項（首句一句一意／固定分節／related 具名）從提醒升為缺陷")
     l.add_argument("--shippable", action="store_true",
                    help="只掃可升級區：日期、PR 號、版本號、單機用語、第一人稱、連進三層、具名清單")
+    l.add_argument("--wording", action="store_true",
+                   help="請本機模型讀機器層，列非台灣講法、套語、文言。提醒不擋。沒給路徑就看相對 main 改過的條目")
+    l.add_argument("paths", nargs="*", help="--wording 要讀的條目；留空取相對 main 的改動")
     l.set_defaults(func=cmd_lint)
 
     t = sub.add_parser("tree", help="依 upstream 印格狀結構——瀏覽視角；查找走 recall")
