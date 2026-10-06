@@ -3376,7 +3376,11 @@ def pipelines_local_save(table):
 
 
 def pipelines_suggestions():
-    """接線建議表：個人 harness 的 pipelines.tsv，{stem: [(repo 別名, repo 相對路徑)]}。"""
+    """接線建議表：個人 harness 的 pipelines.tsv，{stem: [(repo 別名, repo 相對路徑)]}。
+
+    stem 寫 `-` 的列是「已知沒有流程文檔的實作」：工具、函式庫、一次性任務。它們不是流程，
+    drift 不把它們列成缺文檔。要排除什麼得寫在表上，表上沒有的就會被列出來。
+    """
     out = {}
     roots = harness_roots()
     personal = roots.get("personal")
@@ -3447,6 +3451,54 @@ def git_last_change(path):
         return None
     out = git_out("-C", top.strip(), "log", "-1", "--format=%cI", "--", os.path.relpath(path, top.strip()))
     return (out or "").strip() or None
+
+
+# harness repo 裡會被當成「一條實作」的位置。排程一個目錄一條，skill 一個目錄一條，agent 一個檔一條。
+# 底線開頭的目錄（_guides、_archive、_deprecated）是共用材料或退場區，不算實作；<名>-green 是綠副本，也不算。
+# 排程器要求任務目錄是真目錄，所以排程任務常常自己是一個 repo、任務就放在根目錄：根目錄下 */SKILL.md 的
+# 那個目錄算一條。
+HARNESS_IMPL_GLOBS = ("scheduled-tasks/*/", "skills/*/", "agents/*.md", "*/SKILL.md")
+
+
+def harness_implementations():
+    """[harness] 底下所有長得像實作的路徑（絕對路徑）。"""
+    import glob as _glob
+    out = []
+    for alias, root in sorted(harness_roots().items()):
+        if not os.path.isdir(root):
+            continue
+        for pat in HARNESS_IMPL_GLOBS:
+            for p in sorted(_glob.glob(os.path.join(root, pat))):
+                if pat.endswith("/SKILL.md"):
+                    p = os.path.dirname(p)
+                name = os.path.basename(p.rstrip("/"))
+                if name.startswith("_") or name.startswith(".") or name.endswith("-green"):
+                    continue
+                rp = os.path.realpath(p.rstrip("/"))
+                if rp not in out:
+                    out.append(rp)
+    return out
+
+
+def pipelines_undocumented(local):
+    """有實作、沒有流程文檔的：harness 裡的實作路徑，沒被任何啟用表或接線建議指到。
+
+    對帳只從文檔往實作查時，這一類永遠看不見。綠副本第一次跑月檢就抓到 6 筆，所以補成第四類。
+    """
+    known = set()
+    for r in local.values():
+        for p in r.get("path", "").split(","):
+            if p.strip():
+                known.add(os.path.realpath(os.path.expanduser(p.strip())))
+    for stem in pipelines_suggestions():   # 含 `-` 列：已知沒有文檔的工具與一次性任務
+        for p in pipelines_resolve_paths(stem):
+            known.add(os.path.realpath(p))
+    out = []
+    for impl in harness_implementations():
+        if impl in known or any(impl.startswith(k.rstrip("/") + os.sep) for k in known):
+            continue
+        out.append(impl)
+    return out
 
 
 def pipelines_drift(catalog, local):
@@ -3566,7 +3618,8 @@ def cmd_pipelines_drift(args):
     catalog = pipelines_catalog(); local = pipelines_local()
     undecided, enabled, _, retired = pipelines_status(catalog, local)
     impl, doc, nopath = pipelines_drift(catalog, local)
-    if not enabled:
+    undocumented = pipelines_undocumented(local)
+    if not enabled and not undocumented:
         print("沒有啟用的流程，沒有東西可對帳。stack pipelines list")
         return 1 if (undecided or retired) else 0
     for title, rows in (("實作改了，文檔沒跟", impl), ("文檔改了，實作沒跟", doc), ("沒有可對的實作", nopath)):
@@ -3574,12 +3627,16 @@ def cmd_pipelines_drift(args):
             print(f"{title}：{len(rows)} 筆")
             for s, why in rows:
                 print(f"  ✗ {s}：{why}")
+    if undocumented:
+        print(f"有實作、沒有流程文檔：{len(undocumented)} 筆（寫一條 Pipelines/ 或在接線建議表指過去，不然它永遠不在對帳範圍）")
+        for p in undocumented:
+            print(f"  ✗ {p}")
     if retired:
         print(f"已淘汰：{'、'.join(retired)}")
     if undecided:
         print(f"未決定 {len(undecided)} 筆（不在對帳範圍）：{'、'.join(undecided)}")
-    if not (impl or doc or nopath or retired):
-        print(f"啟用的 {len(enabled)} 筆都跟文檔對得上。")
+    if not (impl or doc or nopath or retired or undocumented):
+        print(f"啟用的 {len(enabled)} 筆都跟文檔對得上，harness 裡也沒有沒文檔的實作。")
         return 0
     print("\n對過之後：stack pipelines reconcile <stem>。改了什麼想法寫進文檔的來由。")
     return 1
@@ -3603,9 +3660,10 @@ def doctor_pipelines_rows(entries):
     local = pipelines_local()
     undecided, enabled, disabled, retired = pipelines_status(catalog, local)
     impl, doc, nopath = pipelines_drift(catalog, local)
+    undocumented = pipelines_undocumented(local)
     detail = (f"未決定 {len(undecided)}　啟用 {len(enabled)}（實作改了 {len(impl)}、文檔改了 {len(doc)}、"
-              f"沒實作 {len(nopath)}）　停用 {len(disabled)}　已淘汰 {len(retired)}")
-    level = "WARN" if (undecided or impl or doc or nopath or retired) else "OK"
+              f"沒實作 {len(nopath)}）　停用 {len(disabled)}　已淘汰 {len(retired)}　沒文檔的實作 {len(undocumented)}")
+    level = "WARN" if (undecided or impl or doc or nopath or retired or undocumented) else "OK"
     hint = ""
     if undecided:
         hint = "　→ stack pipelines init 決定本機要跑哪些"
@@ -3613,6 +3671,8 @@ def doctor_pipelines_rows(entries):
         hint = "　→ stack pipelines drift 看哪幾筆"
     elif retired:
         hint = "　→ 啟用表裡有目錄已經沒有的 stem，disable 或刪列"
+    elif undocumented:
+        hint = "　→ stack pipelines drift 列出哪些實作沒有流程文檔"
     return [(level, "pipelines", detail + hint)]
 
 
