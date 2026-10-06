@@ -200,13 +200,16 @@ Pipelines 跟 Expressions 的分界一句：**Expressions 管一格產出寫成�
 表裡沒有）。新裝置全部未決定；棧新增一條之後，每台裝置 pull 到它就是未決定，`stack doctor` 會提示到有人
 `stack pipelines enable` 或 `disable` 為止。接線建議（哪條流程的實作在哪個 harness repo 的哪個路徑）住在個人
 harness repo 的 `pipelines.tsv`，`enable` 查它把路徑填進啟用表；repo 別名對應 `tools/stack.config.toml` 的
-`[harness]`。對帳日放啟用表不放 frontmatter：對帳是「本機的實作」對「文檔」，不同裝置可以不同，而且日期不該
+`[harness]`。排程器讀的目錄常常自己是一個 repo、任務放在根目錄（排程器拒讀連結），工具把根目錄下有 `SKILL.md` 的目錄
+當一條實作，別名慣用 `scheduler`。對帳日放啟用表不放 frontmatter：對帳是「本機的實作」對「文檔」，不同裝置可以不同，而且日期不該
 進可公開的條目。
 
-**漂移有訊號。** `stack pipelines drift` 只看啟用的：實作在 harness repo 的最後 commit 晚於對帳日，列「實作
-改了，文檔沒跟」；文檔在棧的最後 commit 晚於對帳日，列「文檔改了，實作沒跟」。都量日期不比內容，內容對帳是人的
-判斷。看過一致就 `stack pipelines reconcile <stem>`。這是月級訊號：每月的工作流月檢與 curation 的 Step 1 看它，
-每日流程不報。
+**漂移有訊號。** `stack pipelines drift` 列四類：啟用的流程裡實作在 harness repo 的最後 commit 晚於對帳時間，
+「實作改了，文檔沒跟」；文檔在棧的最後 commit 晚於對帳時間，「文檔改了，實作沒跟」；啟用了卻「沒有可對的實作」；
+以及 harness 裡「有實作、沒有流程文檔」的。第四類只從實作往文檔查才看得見，綠副本第一次跑月檢就抓到它。
+工具、函式庫、一次性任務不是流程，在接線建議表用 stem `-` 列出來，drift 就不把它們算成缺文檔；表上沒有的一律列。
+都量時間不比內容，內容對帳是人的判斷。看過一致就 `stack pipelines reconcile <stem>`。這是月級訊號：每月的
+工作流月檢與 curation 的 Step 1 看它，每日流程不報。
 
 下游產物的收錄：`downstream:` 指到的本機檔案要在版控裡。綁組織的進公司側的 harness repo，不綁的
 進個人側的 harness repo，服務棧內容本身的在這裡的 `skills/`。哪個都不是就是漏，`stack doctor` 會報。

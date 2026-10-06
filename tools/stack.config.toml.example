@@ -7,10 +7,12 @@
 # project   = "<你的 mem0 project>"
 
 # harness repo 的本機位置。stack pipelines 用它把接線建議表的 repo 別名換成路徑，doctor 用它報 repo 新不新。
-# 別名自訂，常見是 personal（通用 skill 與接線建議表）與 company（綁組織的 wrapper、agent、排程）。
+# 別名自訂，常見是 personal（通用 skill 與接線建議表）、company（綁組織的 wrapper、agent）、
+# scheduler（排程器讀的那個目錄；排程器拒讀 symlink，所以它自己是一個 repo、任務放在根目錄）。
 # [harness]
-# personal = "~/Personal/harness"
-# company  = "~/Work/agent-harness"
+# personal  = "~/Personal/harness"
+# company   = "~/Work/agent-harness"
+# scheduler = "~/.claude/scheduled-tasks"
 
 # 決策日誌的位置。一個獨立的私有 repo，格式見 templates/journal-entry.md。沒設就不能用 stack journal。
 # [journal]
