@@ -14,6 +14,10 @@
 # company   = "~/Work/agent-harness"
 # scheduler = "~/.claude/scheduled-tasks"
 
+# lint --wording 用的本機判讀模型（Ollama）。沒設用 qwen2.5:7b-instruct；沒拉模型時工具會印拉法。
+# [wording]
+# model = "qwen2.5:7b-instruct"
+
 # 決策日誌的位置。一個獨立的私有 repo，格式見 templates/journal-entry.md。沒設就不能用 stack journal。
 # [journal]
 # path = "~/Personal/decision-journal"

@@ -345,9 +345,10 @@ stack tree                # 依 upstream 印格狀結構。瀏覽視角，查找
 stack shape               # 全量群聚：該收斂的群、內在凝聚度最低的拆分候選
 stack lint                # 索引↔檔案、連結、frontmatter、upstream、詞彙表、索引過期
                           # --strict：契約 v2 的三項從提醒升為缺陷。--shippable：只掃可升級區
+                          # --wording [檔…]：本機模型讀機器層，列非台灣講法、套語、文言。提醒不擋
 stack eval                # 召回率回歸。改嵌入、換模型、大批拆分之後一定要跑。--save-baseline 存基線
 stack usage               # 使用記錄報表：命中統計、log 覆蓋區間、淘汰候選
-stack doctor              # 接線體檢，唯讀
+stack doctor              # 接線體檢，唯讀。含 PR 存取、origin 連線、近 30 天已合併的 PR 是否都到了 main
 stack install --yes       # 接線、建 shim、設 hooksPath
 stack migrate             # 把條目搬成「機器層在前、人層在後」。只搬節、不改句子
 stack memory --sync       # 索引行摘要改成 description 的投影。--check 只報漂移
