@@ -21,6 +21,30 @@ STALE_MINUTES = 30
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAST_RECALL = os.path.join(ROOT, "tools", ".last-recall")
 GUARD_LOG = os.path.join(ROOT, "tools", ".guard.tsv")
+AGENT_SENT = os.path.join(ROOT, "tools", ".agent-sent.tsv")
+
+
+def record_agent_sent(tool, tool_input):
+    """記下這次代寫送出的訊息指紋，供 `stack prose --ref` 從口吻樣本裡排除。
+
+    之後回同一個對話時要抽使用者自己寫的訊息當口吻範本。讀回來的訊息分不出誰寫的，
+    代寫的混進去，錯的口吻就會被當成範本自我複製。只有送出的這一刻知道是代寫。
+
+    指紋函式在 stack 裡（voice_key），這裡載入同一份，不另抄一份。載入失敗就不記，
+    不能因為記錄失敗擋到送出。
+    """
+    texts = [v for v in tool_input.values() if isinstance(v, str)]
+    if not texts:
+        return
+    try:
+        from importlib.machinery import SourceFileLoader
+        stack = SourceFileLoader("stack_tool", os.path.join(ROOT, "tools", "stack")).load_module()
+        key = stack.voice_key(max(texts, key=len))
+        if key:
+            with open(AGENT_SENT, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')}\t{tool}\t{key}\n")
+    except Exception:
+        pass
 
 
 def minutes_since_last_recall():
@@ -58,6 +82,7 @@ def main():
 
     if not is_outward(tool, tool_input):
         return 0
+    record_agent_sent(tool, tool_input)
 
     age = minutes_since_last_recall()
     if age is not None and age <= STALE_MINUTES:
@@ -76,6 +101,8 @@ def main():
         f"[決策棧] 正要用 {tool} 送出對外產出，但{since}（門檻 {STALE_MINUTES} 分）。\n"
         f"  動作成形的那一刻要再檢索一次，查詢句用「我正要做的那個動作」造：\n"
         f"  stack recall \"正要寫這則留言，該寫什麼、寫多長\"\n"
+        f"  即時訊息另外先讀整串，抽使用者自己寫的幾則當口吻樣本，再跑\n"
+        f"  stack prose <草稿> --ref <樣本>\n"
         f"  契約見 tools/context/usage-contract.md。這是提醒，不阻擋。",
         file=sys.stderr,
     )
