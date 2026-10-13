@@ -5,6 +5,7 @@
 .usage.tsv
 .last-recall
 .guard.tsv
+.agent-sent.tsv
 context/.installed-root
 
 # 本機區。裝只對這一台、這一個人成立的東西：驗證日期、接線筆記、事故證據、具名清單。

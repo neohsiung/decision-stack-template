@@ -451,6 +451,62 @@ def prose_stats(body):
             sum(1 for x in lens if x > 40) / len(lens) * 100, n / (chars / 1000))
 
 
+# 即時訊息的量法。prose_stats 量句子，這裡量「一則訊息長什麼樣」：幾行、幾字、有幾行是
+# 文件的版型（編號、條列、粗體、「原因：」這類段落標籤）。對話串裡的人不這樣打字，這幾樣
+# 一多，整則就讀起來像系統通知（Expressions/im-register-follows-the-thread.md）。
+#
+# 多則訊息用獨立一行的 `===` 分開。不用 `---`：prose_body 會把開頭的 `---…---` 當
+# frontmatter 吃掉。草稿檔頭的留痕行與「對象：」那一行不是訊息，量之前拿掉。
+VOICE_SEP = re.compile(r"^\s*===\s*$", re.M)
+VOICE_HEADER = re.compile(r"^\s*(決策棧檢索：|對象：)")
+VOICE_SHAPE = re.compile(
+    r"^\s*(\d+[.)]\s|[-*+]\s|#{1,6}\s|\*\*|[^\s，。、：:]{1,8}[：:]\s*$|[^\s，。、：:]{1,6}[：:])")
+
+
+def voice_messages(text):
+    """切成一則一則訊息，去掉草稿檔頭。空的不算。"""
+    out = []
+    for block in VOICE_SEP.split(text):
+        lines = [l for l in block.splitlines() if l.strip() and not VOICE_HEADER.match(l)]
+        if lines:
+            out.append("\n".join(lines))
+    return out
+
+
+def voice_key(text):
+    """一則訊息的指紋：去掉標記、網址、提及之後的前 40 個中文字。
+
+    送出時的文字與之後從對話讀回來的文字格式不同（提及變成標籤、底線被跳脫、換行被重排），
+    只看中文字才對得上。中文字不到 8 個的短訊息不給指紋：「感恩」這種長度誰寫都一樣，
+    拿來排除只會誤傷使用者自己寫的樣本。outward-write-guard 載入這一支，兩邊共用同一份。
+    """
+    import hashlib
+    t = re.sub(r"<[^>]+>|https?://\S+", "", text or "")
+    zh = "".join(re.findall(r"[\u4e00-\u9fff]", t))
+    if len(zh) < 8:
+        return None
+    return hashlib.sha1(zh[:40].encode("utf-8")).hexdigest()[:12]
+
+
+def agent_sent_keys():
+    """outward-write-guard 記下的代寫指紋。沒有紀錄時回空集合。"""
+    try:
+        with open(os.path.join(ROOT, "tools", ".agent-sent.tsv"), encoding="utf-8") as f:
+            return {l.rstrip("\n").split("\t")[2] for l in f if l.count("\t") >= 2}
+    except OSError:
+        return set()
+
+
+def voice_shape(msgs):
+    """(則數, 每則平均行數, 每則平均字數, 版型行數)。"""
+    if not msgs:
+        return 0, 0.0, 0.0, 0
+    lines = [l for m in msgs for l in m.splitlines()]
+    chars = sum(len(re.sub(r"\s+", "", m)) for m in msgs)
+    shaped = sum(1 for l in lines if VOICE_SHAPE.match(l))
+    return len(msgs), len(lines) / len(msgs), chars / len(msgs), shaped
+
+
 def density(body):
     """(句中破折號/千字, 句均字數)。排除程式碼區塊與表格列。
 
@@ -1304,6 +1360,9 @@ def cmd_prose(args):
               "不要跨語言比。")
         return 0
 
+    if args.ref:
+        return prose_against_ref(args.file, body, args.ref)
+
     try:
         entries = load_entries()
     except SystemExit:
@@ -1313,6 +1372,37 @@ def cmd_prose(args):
         print(f"  對照：這座棧的 {len(entries)} 筆條目 "
               f"句均 {eavg:.1f} 字、超過 40 字 {eover:.1f}%、破折號 {edash:.2f}/千字")
         print(f"  它們都經過 WRITING §寫作指南 的同一份契約。差距大就是契約沒有跟著這份產出走。")
+    return 0
+
+
+def prose_against_ref(path, body, ref_path):
+    """草稿對照使用者自己寫的口吻樣本，而不是對照本棧條目。
+
+    本棧條目是文件文體。拿它當即時訊息的對照線，等於把訊息往文件的方向拉。訊息該像的是
+    同一個對話裡使用者自己打的字，所以對照線換成樣本檔現算的數字。樣本裡混進 agent 代寫
+    送出的訊息時，錯的口吻會被當成範本自我複製，所以先依 .agent-sent.tsv 排除。
+    """
+    try:
+        with open(ref_path, encoding="utf-8", errors="replace") as f:
+            ref = voice_messages(f.read())
+    except OSError as e:
+        die(f"讀不到口吻樣本 {ref_path}：{e}")
+    sent = agent_sent_keys()
+    kept = [m for m in ref if voice_key(m) not in sent]
+    draft = voice_messages(body)
+    dn, dl, dc, ds = voice_shape(draft)
+    print(f"  每則：{dn} 則　平均 {dl:.1f} 行、{dc:.0f} 字　版型行 {ds}（編號、條列、粗體、段落標籤）")
+    if not kept:
+        print(f"  口吻樣本 {ref_path} 沒有可用的訊息"
+              f"（{len(ref)} 則，排除代寫 {len(ref) - len(kept)} 則）。")
+        return 0
+    rn, rl, rc, rs = voice_shape(kept)
+    sn, savg, sover, sdash = prose_stats("\n\n".join(kept))
+    print(f"  對照：口吻樣本 {rn} 則（排除代寫 {len(ref) - len(kept)} 則）"
+          f"　平均 {rl:.1f} 行、{rc:.0f} 字　版型行 {rs}")
+    if sn:
+        print(f"        句均 {savg:.1f} 字、超過 40 字 {sover:.1f}%")
+    print("  樣本是同一個對話裡使用者自己打的字。差距大就是這則還沒照串裡的口吻寫。")
     return 0
 
 
@@ -4299,6 +4389,8 @@ def main():
 
     pr = sub.add_parser("prose", help="量一段文字的句子形狀，可以是 repo 之外的檔案")
     pr.add_argument("file", help="要量的檔案")
+    pr.add_argument("--ref", help="口吻樣本檔：使用者自己在同一個對話寫的訊息，"
+                                  "多則用獨立一行的 === 分開。給了就改拿它當對照線")
     pr.set_defaults(func=cmd_prose)
 
     tr = sub.add_parser("trace", help="查一份計畫或提案裡的留痕行是哪一次檢索留下的")
