@@ -5,6 +5,9 @@ type: decision
 origin: <judgment_case | code_review | self_caught | elicited | external_reference | repo_sync>
 recorded: <入棧當天，YYYY-MM-DD。不回填>
 upstream: Frameworks/<走哪副骨架>.md
+field: <必填，可多值。tools/axes.toml 的 field 名，跨領域填「通用」>
+area: <選填，可多值。該 field 的分區；那個 field 沒有分區表就刪掉這一行>
+stage: <選填。該 field 的工作階段；沒有階段表就刪掉這一行>
 related: <選用。<條目檔名> — 那筆答〈一句〉；本筆答〈一句〉>
 ---
 

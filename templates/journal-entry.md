@@ -2,6 +2,7 @@
 type: journal
 decision: <決定>
 domain: <公司 | 個人 | 生活>
+field: <選填。tools/axes.toml 的 field 名>
 date: <YYYY-MM-DD>
 review_on: <回看日>
 status: open

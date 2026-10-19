@@ -1,0 +1,4 @@
+code	name	remotes
+# 組織代碼與真名的對照。只住在本機區，不進版控。
+# code：tools/axes.toml 的 [org] 代碼。name：真名，stack lint 擋它出現在條目與可升級區。
+# remotes：git remote 的樣式，逗號分隔，例 github.com/<組織>/*。專案的 remote 對得上就推斷是這個組織。

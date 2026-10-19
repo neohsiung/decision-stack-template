@@ -59,6 +59,25 @@ stack doctor                           # 看接線與缺什麼
 
 `install` 預設是 dry-run 只列計畫，加 `--yes` 才寫入。`doctor` 唯讀，含死接線對帳。
 
+### 另一台機器接同一座棧
+
+條目、詞彙表、判準與契約片段都在版控裡，`git pull` 就到齊。下面這些住在機器上，每台各做一次：
+
+```bash
+git clone <你的棧 repo> && cd <它>
+git config user.email <個人信箱>       # pre-commit 的身分閘門；不要用組織信箱
+tools/stack setup --yes --pull         # 目錄、Ollama 與嵌入模型、索引、各 harness 接線
+git remote add template <template repo> # upgrade／contribute 與 doctor 的版本比對要用
+cp -r tools/local.example tools/local  # 再填 orgs.tsv、projects.tsv、context.toml
+stack doctor                           # FAIL 一項一項清掉
+```
+
+外發守衛的 hook 不由 `install` 寫入，要自己加進 `~/.claude/settings.json` 的 `hooks.PreToolUse`，
+`command` 指向 `<棧的絕對路徑>/tools/outward-write-guard`。`doctor` 的〈外發守衛〉那一列會說有沒有接上。
+
+最後在新 session 驗一次片段真的載入：請它原文引用只存在片段裡的一句，引得出來再填
+`tools/local/verified.tsv`。之後每次 `git pull` 完跑一次 `stack doctor`。
+
 `init` 之後棧是空的，而空的棧寫不出第一筆。寫入程序要求新原則掛上游，這時還沒有上游可掛。
 `skills/decision-stack-bootstrap/` 帶你從既有素材反向萃取出最小自洽集合。
 `examples/` 有一組三筆的完整推導鏈可以照著看。
@@ -77,6 +96,8 @@ stack eval                # 對你自己寫的題目跑檢索回歸，跟基線�
 stack usage               # 哪些條目從來沒被任何情境需要
 stack prose <檔案>        # 量任意一段文字的句子形狀，對照棧內條目
 stack tree                # 推導鏈的格狀結構與孤兒
+stack matrix --field 技術  # 一個領域的分區 × 階段，空格是還沒有人寫過的地方
+stack context             # 這個專案戴哪頂帽子：組織、職務、領域、文件語言，各自從哪一層來
 stack migrate             # 分節順序升級時把條目搬成新順序，只搬節不改句子
 stack memory --sync       # 索引行摘要跟著 description 走，不手寫第二份
 stack skeleton <條目>     # 印可以整段複製的骨架，不另開模板目錄

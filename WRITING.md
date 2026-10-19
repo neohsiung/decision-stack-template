@@ -140,7 +140,12 @@ confirmed: <選用，被獨立再次印證的日期，逗號分隔可多筆>
 upstream: <選用，上游條目的 repo 相對路徑，逗號分隔可多筆；方向嚴格向上：decision → Frameworks/ 或 Models/，framework → Models/，model 不設；expression 選用，填了要指進三層>
 audience_direction: <僅 expression，必填。對上 | 水平 | 對下>
 audience_role: <僅 expression，必填。決定者 | 執行者 | 被諮詢者 | 被知會者 | 轉傳者>
-channel: <僅 expression，必填。即時訊息 | 電子郵件 | 票卡留言 | 溝通文件 | 簡報>
+channel: <僅 expression，必填。即時訊息 | 電子郵件 | 票卡留言 | 溝通文件 | 簡報 | 程式碼註解 | 版控紀錄>
+field: <僅 decision 與 expression，必填，可多值。tools/axes.toml 的 field 名；跨領域填「通用」>
+area: <僅 decision 與 expression，選填，可多值。該 field 的分區表裡的值>
+stage: <僅 decision 與 expression，選填。該 field 的階段表裡的值>
+org: <僅 expression，選填。tools/axes.toml 的組織代碼，不寫真名>
+role: <僅 expression，選填，可多值。寫的人的立場，該 field 的 role 表裡的值>
 pipeline_kind: <僅 pipeline，必填。技術 | 管理 | 後設>
 cadence: <僅 pipeline，必填。每日 | 每週 | 每月 | 每季 | 每半年 | 每年 | 事件觸發>
 related: <選用，近似但不等價的對照，一筆一行，格式見 §對照其他條目>
@@ -168,6 +173,20 @@ downstream: <選用，由這筆衍生的下游產物，可多筆>
 `downstream` 列出由這筆衍生的下游產物，一行一筆。受 SPEC §去識別化判準約束：個人工具可以寫
 名字，組織側產物只寫通用描述。例如寫「職級階梯文件」，不寫實際文件標題。它存在的理由是傳播，
 上游變精準時下游不會自動跟上。
+
+`field` 記哪幾種工作會需要撈到這筆，值與每個領域的 `area`、`stage` 表都在 `tools/axes.toml`。
+它不記觸發這筆的事件發生在哪個領域。帶 `--field` 檢索時，只標了別的領域的條目會被濾掉，而且不報錯，
+所以判準照漏撈的代價定：
+
+- 預設填 `通用`。指名得出某一種工作完全不會需要它，才收窄成具體領域。指名不出來就留通用。
+- 開發時也用得到的，把 `技術` 加進去當另一個值，例 `field: 通用, 技術`。通用讓它在任何過濾下都放行，
+  技術讓它進技術的矩陣，`area`、`stage` 也才有地方填。
+- 只有帶人、招募、考核這類管理工作會需要的，才只填 `管理`。
+
+判準見 SPEC §領域軸。
+
+`org` 與 `role` 只掛在 Expression。同一條判斷不因組織或立場而變，變的是寫法。`org` 寫代碼，
+規格句用組織的特性寫條件，不寫它內部的名字。`role` 寫立場，不寫職稱。判準見 SPEC §組織、職務與情境。
 
 ## 用詞對照表
 

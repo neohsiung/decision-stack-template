@@ -6,7 +6,12 @@ origin: <judgment_case | code_review | self_caught | elicited | external_referen
 recorded: <入棧當天，YYYY-MM-DD。不回填>
 audience_direction: <對上 | 水平 | 對下>
 audience_role: <決定者 | 執行者 | 被諮詢者 | 被知會者 | 轉傳者>
-channel: <即時訊息 | 電子郵件 | 票卡留言 | 溝通文件 | 簡報>
+channel: <即時訊息 | 電子郵件 | 票卡留言 | 溝通文件 | 簡報 | 程式碼註解 | 版控紀錄>
+field: <必填，可多值。tools/axes.toml 的 field 名，跨領域填「通用」>
+area: <選填，可多值。該 field 的分區；那個 field 沒有分區表就刪掉這一行>
+stage: <選填。該 field 的工作階段；沒有階段表就刪掉這一行>
+org: <選填。tools/axes.toml 的組織代碼，不綁組織就刪掉這一行。不寫真名>
+role: <選填，可多值。寫的人在這一格的立場，該 field 的 role 表裡的值>
 upstream: <選用。這一格的寫法依據哪條判斷，指進 Models/、Frameworks/ 或 Decisions/>
 downstream: <選用。棧外被執行的那一份的路徑>
 related: <選用。<條目檔名> — 那筆答〈一句〉；本筆答〈一句〉>
