@@ -71,6 +71,8 @@ stack eval                   # retrieval regression against questions you wrote,
 stack usage                  # which entries no situation has ever needed
 stack prose <file>           # sentence shape of any text, compared against your entries
 stack tree                   # the derivation chain and its orphans
+stack matrix --field <name>  # one field's area × stage counts; empty cells are where nothing is written yet
+stack context                # which hat this project wears: org, role, field, doc language, and which layer each came from
 ```
 
 Four things become mechanical rather than remembered:

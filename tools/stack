@@ -104,7 +104,7 @@ SCAN_DIRS = {**LAYERS, EXPRESSIONS: "expression", PIPELINES: "pipeline"}
 EXPRESSION_AXES = {
     "audience_direction": ["對上", "水平", "對下"],
     "audience_role": ["決定者", "執行者", "被諮詢者", "被知會者", "轉傳者"],
-    "channel": ["即時訊息", "電子郵件", "票卡留言", "溝通文件", "簡報"],
+    "channel": ["即時訊息", "電子郵件", "票卡留言", "溝通文件", "簡報", "程式碼註解", "版控紀錄"],
 }
 # Pipelines 的兩軸。類別分技術、管理、後設（後設是維護這套工作流本身的流程）；節奏是它多久跑一次，
 # 事件觸發是沒有固定節奏的那種。兩軸都是組織鍵：管 lint、管索引分組、管矩陣看哪一格沒填。
@@ -191,6 +191,98 @@ def curation_limits():
     return out
 
 
+# 領域軸：field、area、stage。只掛在 Decisions 與 Expressions；Models、Frameworks 是跨領域的通用做法，
+# Pipelines 已有 pipeline_kind。三個鍵的名字不綁任何領域，詞彙由這座棧的 tools/axes.toml 給：
+# 哪些 field、每個 field 有沒有 area 與 stage、各有哪些值。加值或加領域只改那份表，不改工具。
+#
+# 鍵名不用 domain：決策日誌的 domain 記的是場域（公司、個人、生活），這裡記的是領域。
+# 技術判斷要在公司與個人專案共用，所以兩者必須是兩個鍵。
+#
+# 跟其他軸一樣是組織鍵，不進嵌入文字：管 lint、管 recall 的先過濾、管 matrix 看哪一格沒填。
+FIELD_LAYERS = ("Decisions", EXPRESSIONS)
+FIELD_KEYS = ("field", "area", "stage")
+# 跨領域的判斷。過濾時永遠放行，否則每一次帶 --field 的檢索都會漏掉它們。
+FIELD_UNIVERSAL = "通用"
+# 組織與職務只掛在 Expressions：同一條判斷在哪間組織、用什麼立場都成立，寫法才會因組織與立場而變。
+# org 是代碼（真名只在 tools/local/orgs.tsv），role 是寫的人在這一格的立場，不是職稱。
+EXPRESSION_ONLY_KEYS = ("org", "role")
+DOC_LANGUAGES = ("英文", "中文為主英文輔助", "純中文")
+
+
+class AxesError(Exception):
+    """axes.toml 在，但讀不懂。跟「檔不在」分開：讀不懂時整段檢查被跳過，那必須是缺陷不是提醒。"""
+
+
+def read_axes():
+    """這座棧的領域詞彙表。跟 curation.toml 同性質：棧的判斷，不是工具的。檔不在回 None。"""
+    if not os.path.exists(AXES_PATH):
+        return None
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            with open(AXES_PATH, encoding="utf-8") as f:
+                return parse_toml_subset(f.read())
+        except OSError as ex:
+            raise AxesError(str(ex))
+    try:
+        with open(AXES_PATH, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, ValueError) as ex:
+        raise AxesError(str(ex))
+
+
+def field_vocab():
+    """{field 名: {"area": [...], "stage": [...]}}。表不在回 None，跟「表在但是空的」分開。"""
+    axes = read_axes()
+    if axes is None:
+        return None
+    out = {}
+    for name, spec in (axes.get("field", {}) or {}).items():
+        spec = spec if isinstance(spec, dict) else {}
+        out[name] = {k: [str(x) for x in (spec.get(k) or [])] for k in ("area", "stage", "role")}
+    return out
+
+
+def org_vocab():
+    """{組織代碼: [traits]}。代碼與真名的對照不在這裡，在 tools/local/orgs.tsv（不進版控）。"""
+    axes = read_axes() or {}
+    out = {}
+    for code, spec in (axes.get("org", {}) or {}).items():
+        spec = spec if isinstance(spec, dict) else {}
+        out[code] = [str(x) for x in (spec.get("traits") or [])]
+    return out
+
+
+def fm_values(fm, key):
+    """多值欄位。逗號或頓號分隔，跟 upstream 同一種寫法。"""
+    return [v.strip() for v in re.split(r"[,，、]", fm.get(key, "") or "") if v.strip()]
+
+
+def field_gate_from():
+    """field 從哪天起必填。界線前的條目只提醒，留給回填。整節不設 = 全部只提醒。"""
+    return str(read_curation().get("gate", {}).get("field_from", "") or "")
+
+
+def passes_field_filter(e, field=None, area=None, stage=None, org=None, role=None):
+    """recall 的先過濾。只排除「有填、而且填的不是這個」的條目。
+
+    放行三種：沒有領域軸的層（Models、Frameworks、Pipelines），還沒回填的條目，
+    以及 field 含「通用」的。三種任一被擋掉，帶旗標的檢索就會靜默變少，而變少沒有訊號。
+    """
+    if e["layer"] not in FIELD_LAYERS:
+        return True
+    fm = e["fm"]
+    fields = fm_values(fm, "field")
+    if field and fields and field not in fields and FIELD_UNIVERSAL not in fields:
+        return False
+    for key, want in (("area", area), ("stage", stage), ("org", org), ("role", role)):
+        have = fm_values(fm, key)
+        if want and have and want not in have:
+            return False
+    return True
+
+
 # 首句規則句不得含的接續記號：一句只講一個意思
 RULE_FORBIDDEN = ("——", "；", "：")
 # 密度警訊門檻。超過只提醒，不擋。
@@ -201,6 +293,7 @@ RULE_FORBIDDEN = ("——", "；", "：")
 DENSITY_MID_DASH_PER_K = 2.5
 DENSITY_AVG_SENTENCE = 55
 CURATION_PATH = os.path.join(ROOT, "tools", "curation.toml")
+AXES_PATH = os.path.join(ROOT, "tools", "axes.toml")
 INDEX_PATH = os.path.join(ROOT, "tools", ".index.json")
 BRANCH_INDEX_PATH = os.path.join(ROOT, "tools", ".index-branches.json")
 MEMORY_PATH = os.path.join(ROOT, "MEMORY.md")
@@ -1198,8 +1291,33 @@ def cmd_recall(args):
     entries = entries + branch_entries
     qvec = embed([args.query])[0]
 
+    # 先過濾再排序。鄰居與 by_path 仍用全部條目：被過濾掉的條目若被命中條目手接，照樣帶進視野。
+    fargs = tuple(getattr(args, k, None) for k in FIELD_KEYS + EXPRESSION_ONLY_KEYS)
+    pool = [e for e in entries if passes_field_filter(e, *fargs)]
+    filter_note = ""
+    if any(fargs):
+        what = "、".join(f"{k}={v}" for k, v in zip(FIELD_KEYS + EXPRESSION_ONLY_KEYS, fargs) if v)
+        filter_note = f"（過濾 {what}，候選 {len(pool)}/{len(entries)} 筆）"
+        # 打錯字的過濾值不會報錯，只會讓候選變少。對照詞彙表講出來
+        try:
+            vocab = field_vocab() or {}
+        except AxesError:
+            vocab = {}
+        known = {"field": set(vocab),
+                 "area": {v for t in vocab.values() for v in t["area"]},
+                 "stage": {v for t in vocab.values() for v in t["stage"]},
+                 "role": {v for t in vocab.values() for v in t["role"]}}
+        try:
+            known["org"] = set(org_vocab())
+        except AxesError:
+            known["org"] = set()
+        for k, v in zip(FIELD_KEYS + EXPRESSION_ONLY_KEYS, fargs):
+            if v and vocab and v not in known[k]:
+                print(f"⚠ `--{k} {v}` 不在 tools/axes.toml，過濾只會放行沒有領域軸、沒回填與通用的條目",
+                      file=sys.stderr)
+
     scored = []
-    for e in entries:
+    for e in pool:
         score, kind = best(qvec, vecs[e["relpath"]])
         scored.append((score, kind, e))
     scored.sort(key=lambda t: -t[0])
@@ -1210,7 +1328,8 @@ def cmd_recall(args):
     # 未審有兩個來源，都要標：工作目錄裡尚未進 origin/main 的，與未合併分支上的。
     # 只標其中一種等於讓另一種靜默——那正是這兩個功能各自要防的事。
     unreviewed = unreviewed_paths()
-    print(f"掃描 {len(entries)} 筆／{n_views} 個視角{branch_note}，命中 top-{args.k}：\n")
+    ctx = resolve_context(os.getcwd())
+    print(f"掃描 {len(entries)} 筆／{n_views} 個視角{branch_note}{filter_note}，命中 top-{args.k}：\n")
     for score, kind, e in hits:
         if e.get("branch"):
             mark = f"  〔未審 · {e['branch']}〕"
@@ -1250,11 +1369,11 @@ def cmd_recall(args):
     # 但在它帶時戳之前，沒有任何東西查得出它是哪一次檢索留下的。
     import datetime
     _ts = datetime.datetime.now().isoformat(timespec="seconds")
-    print(f"\n決策棧檢索：{_ts} 命中 {names}{stale_note}")
+    print(f"\n決策棧檢索：{_ts} 命中 {names}{filter_note}{stale_note}")
 
     neigh_stems = [by_path[n]["stem"] for n in neighbours
                    if n in by_path] if neighbours else []
-    log_usage(args.query, [e["stem"] for _, _, e in hits], neigh_stems)
+    log_usage(args.query, [e["stem"] for _, _, e in hits], neigh_stems, context_tag(ctx))
 
 
 # ---------------------------------------------------------------- 使用記錄
@@ -1279,7 +1398,7 @@ def _session_tag():
     return f"p{os.getppid()}"
 
 
-def log_usage(query, stems, neighbours=()):
+def log_usage(query, stems, neighbours=(), ctx_tag=""):
     """每次 recall 記一行：日期、查詢、直接命中、鄰居觸及。淘汰判準的機械訊號（§各層契約）。
 
     **兩欄分開記，因為它們是兩種不同的「被用到」。** 直接命中＝向量檢索撈到；鄰居觸及＝
@@ -1299,7 +1418,7 @@ def log_usage(query, stems, neighbours=()):
                     f"{query[:120].replace(chr(9), ' ')}\t{','.join(stems)}\t"
                     f"{','.join(neighbours)}\t"
                     f"{datetime.datetime.now().isoformat(timespec='seconds')}\t"
-                    f"{_session_tag()}\n")
+                    f"{_session_tag()}\t{ctx_tag}\n")
     except OSError:
         pass
     _stamp_last_recall(query)
@@ -1800,7 +1919,7 @@ def cmd_shape(args):
 # 實際受檢的範圍是這一組與 UPGRADABLE_GLOBS 的聯集，見 shippable_files()。
 SHIPPABLE_GLOBS = ["README.md", "README.en.md", "SPEC.md", "WRITING.md", "examples/*.md", "tools/stack", "tools/outward-write-guard", "tools/hooks/*",
                    "tools/context/*.md", "tools/context/MANIFEST.tsv", "skills/*/*.md",
-                   "tools/local.example/*", "tools/stack.config.toml.example",
+                   "tools/local.example/*", "tools/stack.config.toml.example", "tools/axes.toml.example",
                    "templates/*.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "LICENSE",
                    ".github/*.md", ".github/ISSUE_TEMPLATE/*"]
 # 只對一個時點或一台機器成立的句子會用到的字。命中就擋。
@@ -1852,6 +1971,7 @@ def shippable_scan():
     """
     fails, warns = [], []
     deny = read_denylist()
+    org_names = [o["name"] for o in read_orgs()]
     for rel in shippable_files():
         with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as f:
             lines = f.read().split("\n")
@@ -1874,6 +1994,8 @@ def shippable_scan():
                 if re.search(pat, line):
                     fails.append((rel, i, kind, snippet))
                     break
+            if org_name_hits(raw, org_names):
+                fails.append((rel, i, "組織真名", snippet))
             else:
                 for pat, kind in SHIP_WARN:
                     if re.search(pat, line):
@@ -2044,6 +2166,162 @@ def cmd_lint_shippable():
     return 1 if fails else 0
 
 
+def field_problems(e, vocab, gate, problems, missing):
+    """領域軸的檢查。表不在時整段不查（呼叫端已提醒過一次）。
+
+    三件事：值在表裡；area、stage 屬於這筆所填的 field；沒有領域軸的層不得填。
+    缺 field 只在界線之後算缺陷，界線前收進 missing 交給回填。
+    """
+    if vocab is None:
+        return
+    fm, rel = e["fm"], e["relpath"]
+    if e["layer"] not in FIELD_LAYERS:
+        for key in FIELD_KEYS:
+            if fm.get(key):
+                problems.append(f"{rel}：`{key}` 只掛在 Decisions 與 Expressions，"
+                                f"{e['layer']} 是跨領域的層")
+        return
+    fields = fm_values(fm, "field")
+    if not fields:
+        if gate and fm.get("recorded", "") >= gate:
+            problems.append(f"{rel}：缺 frontmatter `field`（{gate} 之後入棧的條目必填）")
+        else:
+            missing.append(e["stem"])
+        for key in ("area", "stage"):
+            if fm.get(key):
+                problems.append(f"{rel}：填了 `{key}` 卻沒填 `field`，分區與階段要掛在某個領域底下")
+        return
+    for f in fields:
+        if f not in vocab:
+            problems.append(f"{rel}：`field: {f}` 不在 tools/axes.toml（{'／'.join(vocab)}）")
+    for key in ("area", "stage"):
+        allowed = {v for f in fields for v in vocab.get(f, {}).get(key, [])}
+        for v in fm_values(fm, key):
+            if v not in allowed:
+                where = "、".join(fields)
+                problems.append(f"{rel}：`{key}: {v}` 不屬於 {where} 的{'分區' if key == 'area' else '階段'}表"
+                                f"（{'／'.join(sorted(allowed)) or '這些領域沒有定義'}）")
+
+
+def cmd_stats(args):
+    """origin × field，加近幾個月被糾正（judgment_case）的筆數。決策準確度唯一的真值是使用者開口糾正。
+
+    只數不判：糾正數下降可能是判斷變準，也可能是沒人在看。讀的人自己對照。
+    """
+    import datetime
+    entries = [e for e in load_entries() if e["layer"] in FIELD_LAYERS]
+    def fields_of(e):
+        return fm_values(e["fm"], "field") or ["（未回填）"]
+    origins = sorted({e["fm"].get("origin", "?") for e in entries})
+    fields = sorted({f for e in entries for f in fields_of(e)}, key=lambda x: (x.startswith("（"), x))
+    count = {(f, o): 0 for f in fields for o in origins}
+    for e in entries:
+        for f in fields_of(e):
+            count[(f, e["fm"].get("origin", "?"))] += 1
+    w = max(len(f) for f in fields) + 2
+    print(f"Decisions＋Expressions {len(entries)} 筆，origin × field（多值條目在每個領域各算一次）\n")
+    print(" " * w + "".join(f"{o[:12]:>16}" for o in origins))
+    for f in fields:
+        print(f"{f:<{w}}" + "".join(f"{count[(f, o)]:>16}" for o in origins))
+    today = datetime.date.today()
+    months = []
+    y, m = today.year, today.month
+    for _ in range(args.months):
+        months.append(f"{y:04d}-{m:02d}")
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    months.reverse()
+    print(f"\n每月 judgment_case（被糾正）筆數，依 recorded：")
+    print(" " * w + "".join(f"{mo:>9}" for mo in months))
+    for f in fields:
+        row = [sum(1 for e in entries if e["fm"].get("origin") == "judgment_case"
+                   and f in fields_of(e) and e["fm"].get("recorded", "").startswith(mo)) for mo in months]
+        print(f"{f:<{w}}" + "".join(f"{n:>9}" for n in row))
+    print("\n只數不判：下降可能是判斷變準，也可能是那個領域沒有在做事。")
+    return 0
+
+
+def org_role_problems(e, vocab, orgs, problems):
+    """org 代碼要在 axes.toml 的 [org] 有定義，role 要在所填 field 的 role 表裡，兩者只掛在 Expressions。"""
+    if vocab is None:
+        return
+    fm, rel = e["fm"], e["relpath"]
+    if e["layer"] != EXPRESSIONS:
+        for key in EXPRESSION_ONLY_KEYS:
+            if fm.get(key):
+                problems.append(f"{rel}：`{key}` 只掛在 Expressions，判斷本身不因組織或立場而變")
+        return
+    for code in fm_values(fm, "org"):
+        if code not in orgs:
+            problems.append(f"{rel}：`org: {code}` 沒有在 tools/axes.toml 的 [org] 定義"
+                            f"（{'／'.join(orgs) or '目前一個都沒有'}）")
+    roles = fm_values(fm, "role")
+    fields = fm_values(fm, "field")
+    if roles and not fields:
+        problems.append(f"{rel}：填了 `role` 卻沒填 `field`，職務立場的詞彙依領域而定")
+        return
+    allowed = {v for f in fields for v in vocab.get(f, {}).get("role", [])}
+    for r in roles:
+        if r not in allowed:
+            problems.append(f"{rel}：`role: {r}` 不屬於 {'、'.join(fields)} 的職務表"
+                            f"（{'／'.join(sorted(allowed)) or '這些領域沒有定義'}）")
+
+
+def org_name_hits(text, names):
+    """組織真名在這段文字裡出現的那幾個。大小寫不分。
+
+    拉丁字母與數字組成的名字要整個詞對上，否則「Meta」會撞到 metadata、「Line」撞到 outline。
+    中文沒有詞界，照子字串比。
+    """
+    out = []
+    for n in names:
+        if not n:
+            continue
+        pat = re.escape(n)
+        if re.fullmatch(r"[\x00-\x7f]+", n):
+            pat = r"(?<![A-Za-z0-9])" + pat + r"(?![A-Za-z0-9])"
+        if re.search(pat, text, re.I):
+            out.append(n)
+    return out
+
+
+def cmd_matrix(args):
+    """一個 field 的 area × stage 筆數。空格不是待辦，是還沒有事件揭露它；遇到時才寫，不預建。"""
+    try:
+        vocab = field_vocab()
+    except AxesError as ex:
+        die(f"tools/axes.toml 讀不懂：{ex}")
+    if vocab is None:
+        die("tools/axes.toml 不在。從 tools/axes.toml.example 複製一份再填")
+    if args.field not in vocab:
+        die(f"`{args.field}` 不在 tools/axes.toml（{'／'.join(vocab)}）")
+    areas = vocab[args.field]["area"] or ["（無分區）"]
+    stages = vocab[args.field]["stage"] or ["（無階段）"]
+    grid = {(a, s): 0 for a in areas for s in stages}
+    unplaced = 0
+    tagged = [e for e in load_entries()
+              if e["layer"] in FIELD_LAYERS and args.field in fm_values(e["fm"], "field")]
+    for e in tagged:
+        ea = fm_values(e["fm"], "area") or (areas if not vocab[args.field]["area"] else [])
+        es = fm_values(e["fm"], "stage") or (stages if not vocab[args.field]["stage"] else [])
+        cells = [(a, st) for a in ea for st in es if (a, st) in grid]
+        if not cells:
+            # 沒填、或填的值不在這個 field 的表裡（lint 會另外報）。都算攤不進格子
+            unplaced += 1
+            continue
+        for c in cells:
+            grid[c] += 1
+    w = max(len(a) for a in areas) + 2
+    print(f"{args.field}：{len(tagged)} 筆（攤不進格子的 {unplaced} 筆。多值條目在每一格各算一次，"
+          f"格子加總可能大於筆數）\n")
+    print(" " * w + "".join(f"{s:>6}" for s in stages))
+    for a in areas:
+        print(f"{a:<{w}}" + "".join(f"{grid[(a, s)]:>6}" for s in stages))
+    empty = [f"{a}×{s}" for a in areas for s in stages if grid[(a, s)] == 0]
+    if empty:
+        print(f"\n空格 {len(empty)}：{'、'.join(empty)}")
+    return 0
+
+
 def cmd_lint(args):
     if getattr(args, "wording", False):
         return cmd_lint_wording(getattr(args, "paths", None) or [])
@@ -2074,6 +2352,22 @@ def cmd_lint(args):
                        f"（例：{'、'.join(p for _, p, _, _ in drift[:3])}）")
 
     # 2. frontmatter 與規則句
+    fgate, field_missing = field_gate_from(), []
+    try:
+        fvocab = field_vocab()
+    except AxesError as ex:
+        fvocab = None
+        problems.append(f"tools/axes.toml 讀不懂，field／area／stage 全部沒有檢查：{ex}")
+    try:
+        orgs = org_vocab()
+    except AxesError:
+        orgs = {}
+    org_names = [o["name"] for o in read_orgs()]
+    if not org_names:
+        notices.append("tools/local/orgs.tsv 沒有任何真名：組織真名外流檢查沒有跑（檔不在，或只有欄名）")
+    if fvocab is None and not any(p.startswith("tools/axes.toml") for p in problems):
+        notices.append("tools/axes.toml 不在：field／area／stage 不檢查。"
+                       "從 tools/axes.toml.example 複製一份再填")
     for e in entries:
         fm = e["fm"]
         for field in REQUIRED_FIELDS:
@@ -2093,8 +2387,18 @@ def cmd_lint(args):
                 elif val not in vocab:
                     problems.append(f"{e['relpath']}：`{axis}: {val}` 不在受控詞彙"
                                     f"（{'／'.join(vocab)}）")
+        field_problems(e, fvocab, fgate, problems, field_missing)
+        org_role_problems(e, fvocab, orgs, problems)
+        if org_names:
+            raw = "\n".join(str(v) for v in e["fm"].values()) + "\n" + e["body"]
+            for n in org_name_hits(raw, org_names):
+                problems.append(f"{e['relpath']}：出現組織真名（tools/local/orgs.tsv 第二欄），改寫成代碼或特性")
         if not first_rule(e["body"]):
             problems.append(f"{e['relpath']}：正文沒有粗體規則句（檢索比對的就是這句）")
+
+    if field_missing:
+        notices.append(f"還沒填 field：{len(field_missing)} 筆（界線前，回填的輸入，"
+                       f"例：{'、'.join(field_missing[:3])}）")
 
     # 2b. 寫作契約 v2：首句一句一意、每層固定分節、related 具名。
     # 舊條目還沒改寫完之前這三項只提醒；--strict 才擋。改寫完後 pre-commit 改用 --strict。
@@ -2328,6 +2632,24 @@ def cmd_lint(args):
     return 0
 
 
+PENDING_MARK = "待建:"
+
+
+def eval_by_field(per):
+    """[(label, 名次, 過濾後名次或 None)] → {label: n、top3、avg，有過濾的再加 f_top3、f_avg}。"""
+    out = {}
+    for lab in sorted({p[0] for p in per}, key=lambda x: (x == "（未標）", x)):
+        rows = [p for p in per if p[0] == lab]
+        d = {"n": len(rows), "top3": sum(1 for _, r, _ in rows if r <= 3),
+             "avg": round(sum(r for _, r, _ in rows) / len(rows), 1)}
+        fr = [f for _, _, f in rows if f is not None]
+        if fr:
+            d["f_top3"] = sum(1 for f in fr if f <= 3)
+            d["f_avg"] = round(sum(fr) / len(fr), 1)
+        out[lab] = d
+    return out
+
+
 def cmd_eval(args):
     """召回率回歸。這是唯一能證明工具沒有偷偷變差的東西——改嵌入、換模型、大批拆分後都要跑。"""
     path = os.path.join(ROOT, "tools", "regression.tsv")
@@ -2339,46 +2661,87 @@ def cmd_eval(args):
         for line in f:
             if line.startswith("#") or "\t" not in line:
                 continue
-            q, expect = line.rstrip("\n").split("\t", 1)
-            cases.append((q, [x.strip() for x in expect.split(",") if x.strip()]))
+            # 第三欄選填：這題屬於哪個領域（field 或 field/area）。有標的題目另算一次先過濾的名次，
+            # 拿來對照「帶 --field」與「不帶」。沒標的題目只算不過濾的那一次。
+            cols = line.rstrip("\n").split("\t")
+            q, expect = cols[0], cols[1]
+            label = cols[2].strip() if len(cols) > 2 else ""
+            cases.append((q, [x.strip() for x in expect.split(",") if x.strip()], label))
 
     if not cases:
         print("回歸語料裡沒有題目。eval 不適用。題目怎麼加見該檔檔頭。")
         return 0
     entries = load_entries()
     vecs = ensure_index(entries, verbose=True)
-    ranks, worst = [], []
-    for query, expected in cases:
-        qvec = embed([query])[0]
-        order = sorted(((best(qvec, vecs[e["relpath"]])[0], e) for e in entries),
-                       key=lambda t: -t[0])
-        stems = [e["stem"] for _, e in order]
+    qvecs = [embed([q])[0] for q, _, _ in cases]
+    ranks, worst, absent = [], [], []
+    live = {e["stem"] for e in entries}
+    # 分領域小計：(label, 不過濾名次, 先過濾名次或 None)
+    per = []
+    for (query, expected, label), qvec in zip(cases, qvecs):
+        scored = sorted(((best(qvec, vecs[e["relpath"]])[0], e) for e in entries),
+                        key=lambda t: -t[0])
+        stems = [e["stem"] for _, e in scored]
+        fstems = None
+        if label:
+            field, _, area = label.partition("/")
+            fstems = [e["stem"] for _, e in scored if passes_field_filter(e, field, area or None)]
         for exp in expected:
+            # 「待建:」前綴＝題目先寫、條目還沒建。只有標了的才不計入；沒標而找不到的條目
+            # 照舊算 999，因為那多半是改名或誤刪，排除掉會讓退步看起來像進步。
+            pending = exp.startswith(PENDING_MARK)
+            exp = exp[len(PENDING_MARK):] if pending else exp
+            if pending and exp not in live:
+                absent.append((exp, query))
+                continue
+            if pending:
+                print(f"  · {exp} 標了待建但已經建檔，把語料裡的「{PENDING_MARK}」拿掉")
             r = stems.index(exp) + 1 if exp in stems else 999
+            fr = (fstems.index(exp) + 1 if exp in fstems else 999) if fstems is not None else None
             ranks.append(r)
+            per.append((label or "（未標）", r, fr))
             mark = "✓" if r <= 3 else ("△" if r <= args.k else "✗")
-            print(f"  {mark} rank {r:>3}  {exp}")
+            ftxt = f"　過濾後 {fr:>3}" if fr is not None else ""
+            print(f"  {mark} rank {r:>3}{ftxt}  {exp}")
             if r > 3:
                 worst.append((r, exp, query))
+    if not ranks:
+        print("沒有可算的題目：期望的條目全都標了待建。")
+        return 1
     top3 = sum(1 for r in ranks if r <= 3)
     topk = sum(1 for r in ranks if r <= args.k)
     avg = sum(ranks) / len(ranks)
     print(f"\ntop-3 命中 {top3}/{len(ranks)}　top-{args.k} 命中 {topk}/{len(ranks)}"
           f"　平均 rank {avg:.1f}")
+    by_field = eval_by_field(per)
+    if any(lab != "（未標）" for lab in by_field):
+        print("\n分領域（不過濾 → 先過濾。未回填的條目一律放行，回填前兩欄會一樣）：")
+        for lab, d in by_field.items():
+            line = f"  {lab:<10} {d['n']:>2} 題　top-3 {d['top3']}/{d['n']}　平均 rank {d['avg']}"
+            if d.get("f_top3") is not None:
+                line += f"　→　top-3 {d['f_top3']}/{d['n']}　平均 rank {d['f_avg']}"
+            print(line)
     # 基線存檔、不抄進文件。抄進散文的數字會跟實際值分岔。
     if os.path.exists(EVAL_BASELINE_PATH):
         try:
             b = json.load(open(EVAL_BASELINE_PATH, encoding="utf-8"))
             print(f"基線（{b.get('date')}，{b.get('entries')} 筆）：top-3 {b.get('top3')}/{b.get('n')}"
                   f"　top-{args.k} {b.get('topk')}/{b.get('n')}　平均 rank {b.get('avg')}")
+            for lab, d in (b.get("by_field") or {}).items():
+                ftxt = (f"　→　top-3 {d['f_top3']}/{d['n']}" if d.get("f_top3") is not None else "")
+                print(f"  基線 {lab:<10} top-3 {d['top3']}/{d['n']}{ftxt}")
         except (OSError, ValueError):
             pass
     if getattr(args, "save_baseline", False):
         json.dump({"date": datetime.date.today().isoformat(), "entries": len(entries),
                    "n": len(ranks), "top3": top3, "topk": topk, "k": args.k,
-                   "avg": round(avg, 2)},
+                   "avg": round(avg, 2), "by_field": by_field},
                   open(EVAL_BASELINE_PATH, "w", encoding="utf-8"), ensure_ascii=False)
         print(f"基線已存 {os.path.relpath(EVAL_BASELINE_PATH, ROOT)}")
+    if absent:
+        print(f"\n標了待建、條目還沒建檔，不計入（{len(absent)} 題）：")
+        for exp, q in absent:
+            print(f"  · {exp}  ←  {q[:40]}…")
     if worst:
         print("\n掉出 top-3 的（改動後這幾筆變差就是退步）：")
         for r, exp, q in sorted(worst, reverse=True):
@@ -2387,7 +2750,7 @@ def cmd_eval(args):
     # 檢索吸子：在多個彼此無關的查詢都擠進 top-3 的條目。它不是排序的問題，是那一筆
     # 同時服務太多檢索情境（SRP 違反），而視角越多＝抽獎券越多。**要拆的是條目，不是調參數。**
     attractor = {}
-    for (query, expected), qvec in zip(cases, [embed([q]) [0] for q, _ in cases]):
+    for (query, expected, _), qvec in zip(cases, qvecs):
         order = sorted(((best(qvec, vecs[e["relpath"]])[0], e) for e in entries),
                        key=lambda t: -t[0])[:3]
         for _, e in order:
@@ -2411,21 +2774,37 @@ def parse_toml_subset(text):
     只為了 tomllib 不在的直譯器存在，見 read_config。設定檔的形狀由 .example 固定，
     超出這個子集的寫法會被忽略而不是猜。
     """
-    out, cur = {}, None
+    out, cur, pending = {}, None, None
     for raw in text.split("\n"):
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
+        if pending is not None:
+            # 多行陣列：tomllib 讀得懂，這裡也要讀得懂，否則兩種直譯器給出不同的詞彙表
+            key, buf = pending
+            buf += " " + line
+            if line.endswith("]"):
+                cur[key] = [a or b for a, b in re.findall(r'"([^"]*)"|\'([^\']*)\'', buf) if a or b]
+                pending = None
+            else:
+                pending = (key, buf)
+            continue
         if line.startswith("[") and line.endswith("]"):
             cur = out
+            # 非 ASCII 的鍵在 TOML 裡要加引號（[field."技術"]），這裡一併剝掉
             for part in line[1:-1].split("."):
-                cur = cur.setdefault(part.strip(), {})
+                cur = cur.setdefault(part.strip().strip("\"'"), {})
             continue
         if "=" in line and cur is not None:
             k, _, v = line.partition("=")
             v = v.strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
                 cur[k.strip()] = v[1:-1]
+            elif v.startswith("[") and v.endswith("]"):
+                # 字串陣列。axes.toml 的 area、stage 用得到
+                cur[k.strip()] = [a or b for a, b in re.findall(r'"([^"]*)"|\'([^\']*)\'', v) if a or b]
+            elif v.startswith("["):
+                pending = (k.strip(), v)
             elif re.fullmatch(r"-?\d+", v):
                 cur[k.strip()] = int(v)
     return out
@@ -2597,6 +2976,11 @@ def cmd_init(args):
     if os.path.exists(cfg_example):
         ensure_file(os.path.join("tools", "stack.config.toml"),
                     open(cfg_example, encoding="utf-8").read())
+    # 領域詞彙表是這座棧的判斷，實檔進私有區；範本跟工具一起升級
+    axes_example = os.path.join(ROOT, "tools", "axes.toml.example")
+    if os.path.exists(axes_example):
+        ensure_file(os.path.join("tools", "axes.toml"),
+                    open(axes_example, encoding="utf-8").read())
 
     for rel in made:
         print(f"  ✓ 建了 {rel}")
@@ -2652,13 +3036,13 @@ UPGRADABLE_GLOBS = [
     "README.md", "README.en.md", "SPEC.md", "WRITING.md", "examples/*.md", "LICENSE", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", ".gitignore",
     "tools/stack", "tools/outward-write-guard", "tools/VERSION", "tools/.gitignore",
     "tools/hooks/*", "tools/context/*.md", "tools/context/MANIFEST.tsv",
-    "tools/testdata/*/*", "tools/local.example/*", "tools/stack.config.toml.example",
+    "tools/testdata/*/*", "tools/local.example/*", "tools/stack.config.toml.example", "tools/axes.toml.example",
     "templates/*.md", "skills/*/SKILL.md",
     ".github/*.md", ".github/*/*",
 ]
 # 永遠不跨界的東西。列出來是為了讓「為什麼不是可升級區」看得見，不是給程式判斷用的。
 PRIVATE_NOTE = ("Models/、Frameworks/、Decisions/、Expressions/、Pending/ 的條目，"
-                "MEMORY.md、GLOSSARY.md、AGENTS.md、Profile/、tools/local/、tools/stack.config.toml、tools/curation.toml、"
+                "MEMORY.md、GLOSSARY.md、AGENTS.md、Profile/、tools/local/、tools/stack.config.toml、tools/curation.toml、tools/axes.toml、"
                 "tools/regression.tsv")
 
 
@@ -2934,7 +3318,146 @@ VERSION_PATH = os.path.join(ROOT, "tools", "VERSION")
 LOCAL_DIR = os.path.join(ROOT, "tools", "local")
 VERIFIED_PATH = os.path.join(LOCAL_DIR, "verified.tsv")
 DENYLIST_PATH = os.path.join(LOCAL_DIR, "denylist.txt")
+# 情境檔：裝置與專案各戴哪頂帽子。三份都在本機區，不進版控、不寫進專案的 repo。
+ORGS_PATH = os.path.join(LOCAL_DIR, "orgs.tsv")
+PROJECTS_PATH = os.path.join(LOCAL_DIR, "projects.tsv")
+CONTEXT_PATH = os.path.join(LOCAL_DIR, "context.toml")
+CONTEXT_KEYS = ("org", "role", "field", "doc_language")
+NONE_MARK = "-"
 EVAL_BASELINE_PATH = os.path.join(ROOT, "tools", ".eval-baseline.json")
+
+
+def read_local_tsv(path, cols):
+    """本機區的 tsv：# 開頭是註解，第一個非註解行若是欄名就跳過。缺的欄補空字串。"""
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip() or line.startswith("#"):
+                continue
+            vals = [v.strip() for v in line.rstrip("\n").split("\t")]
+            if vals[0] == cols[0]:
+                continue
+            rows.append(dict(zip(cols, vals + [""] * (len(cols) - len(vals)))))
+    return rows
+
+
+def read_orgs():
+    """[{code, name, remotes}]。name 是真名，只住在這台機器；remotes 是 git remote 的樣式，逗號分隔。"""
+    return read_local_tsv(ORGS_PATH, ("code", "name", "remotes"))
+
+
+def normalize_remote(url):
+    """git remote URL → host/owner/repo，比對樣式用。https、ssh、scp 三種寫法收成同一種。"""
+    u = url.strip().lower()
+    m = re.match(r"^[a-z][a-z0-9+.-]*://", u)
+    if m:
+        # scheme://[user[:pass]@]host[:port]/path：埠號只會出現在這種寫法
+        u = u[m.end():]
+        u = re.sub(r"^[^@/]+@", "", u)
+        u = re.sub(r"^([^/:]+):\d+(?=/)", r"\1", u)
+    else:
+        # scp 寫法 user@host:path，冒號後面是路徑，即使以數字開頭
+        u = re.sub(r"^[^@/]+@", "", u)
+        u = re.sub(r"^([^/:]+):", r"\1/", u)
+    return re.sub(r"\.git/?$", "", u).rstrip("/")
+
+
+def git_remotes(cwd):
+    try:
+        r = subprocess.run(["git", "-C", cwd, "remote", "-v"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted({normalize_remote(l.split()[1]) for l in r.stdout.splitlines() if len(l.split()) >= 2})
+
+
+def resolve_context(cwd):
+    """{鍵: (值, 來源層)}。四層依序取第一個有值的，每個鍵各自往下找。
+
+    1 專案明示：projects.tsv 的路徑前綴，取最長的那一列
+    2 遠端推斷：這個目錄的 git remote 對上 orgs.tsv 的樣式，只給得出 org
+    3 裝置預設：context.toml 的 [device]
+    4 未宣告
+    """
+    import fnmatch
+    out = {k: (None, None) for k in CONTEXT_KEYS}
+    def fill(values, source):
+        # 來源層是 None 才往下找。值寫「-」＝明示沒有（例：個人專案沒有組織），下層不得補上
+        for k in CONTEXT_KEYS:
+            if out[k][1] is None and values.get(k):
+                out[k] = (None if values[k] == NONE_MARK else values[k], source)
+    cwd = os.path.realpath(cwd)
+    best_row, best_len = None, -1
+    for row in read_local_tsv(PROJECTS_PATH, ("path",) + CONTEXT_KEYS):
+        pref = os.path.realpath(os.path.expanduser(row["path"]))
+        if (cwd == pref or cwd.startswith(pref.rstrip("/") + "/")) and len(pref) > best_len:
+            best_row, best_len = row, len(pref)
+    if best_row:
+        fill(best_row, "專案明示")
+    if out["org"][1] is None:
+        remotes = git_remotes(cwd)
+        for o in read_orgs():
+            pats = [x.strip() for x in o["remotes"].split(",") if x.strip()]
+            if any(fnmatch.fnmatch(r, pat.lower()) for r in remotes for pat in pats):
+                fill({"org": o["code"]}, "遠端推斷")
+                break
+    dev = {}
+    if os.path.exists(CONTEXT_PATH):
+        with open(CONTEXT_PATH, encoding="utf-8") as f:
+            dev = parse_toml_subset(f.read()).get("device", {}) or {}
+    fill({k: str(v) for k, v in dev.items()}, "裝置預設")
+    return out
+
+
+def context_tag(ctx):
+    """寫進使用記錄的一欄：哪些鍵、從哪一層來。都沒有就是「未宣告」。值本身不記，代碼也不記。"""
+    parts = [f"{k}@{src}" for k, (v, src) in ctx.items() if src]
+    return ",".join(parts) or "未宣告"
+
+
+def cmd_context(args):
+    """印這個目錄的情境與每個值的來源層。套錯時看來源層就知道該改哪一份檔。"""
+    if args.audit:
+        return context_audit(args.days)
+    ctx = resolve_context(os.getcwd())
+    for k, (v, src) in ctx.items():
+        tail = f"　← {src}" if v else (f"　明示沒有 ← {src}" if src else "　未宣告")
+        print(f"  {k:<13} {v or '—'}{tail}")
+    lang = ctx["doc_language"][0]
+    if lang and lang not in DOC_LANGUAGES:
+        print(f"\n⚠ doc_language `{lang}` 不是 {'／'.join(DOC_LANGUAGES)} 之一")
+    if not any(src for _, src in ctx.values()):
+        print("\n這個目錄沒有宣告。問一次使用者，答案寫進 tools/local/projects.tsv：")
+        print(f"  {os.getcwd()}\t<org 代碼>\t<role>\t<field>\t<{'｜'.join(DOC_LANGUAGES)}>")
+    flags = " ".join(f"--{k} {ctx[k][0]}" for k in ("field", "org", "role") if ctx[k][0])
+    if flags:
+        print(f"\nrecall 帶上：stack recall {flags} \"<動作句>\"")
+    return 0
+
+
+def context_audit(days):
+    """近 N 天 recall 的情境來源分佈。「未宣告」與「裝置預設」多，代表該補第 1 或第 2 層。"""
+    import datetime
+    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    total, tagged, by = 0, 0, {}
+    if os.path.exists(USAGE_PATH):
+        with open(USAGE_PATH, encoding="utf-8") as f:
+            for line in f:
+                cols = line.rstrip("\n").split("\t")
+                if not cols or cols[0] < since:
+                    continue
+                total += 1
+                if len(cols) < 7:
+                    continue
+                tagged += 1
+                org_src = next((p.split("@", 1)[1] for p in cols[6].split(",") if p.startswith("org@")),
+                               "未宣告")
+                by[org_src] = by.get(org_src, 0) + 1
+    print(f"近 {days} 天 recall {total} 次，有記情境的 {tagged} 次（舊記錄沒有這一欄）")
+    for src in ("專案明示", "遠端推斷", "裝置預設", "未宣告"):
+        print(f"  org 來自 {src:<6} {by.get(src, 0)}")
+    return 0
 
 
 def read_verified():
@@ -3414,11 +3937,158 @@ def doctor_self_test():
     for level, label, detail in rows:
         print(f"  [{level}] {label}：{detail}")
     caught = {l for l, _, _ in rows}
-    if "FAIL" in caught:
-        print("\n負向測試通過：檢查器在壞掉的 MANIFEST 上會紅。")
-        return 0
-    print("\n負向測試失敗：檢查器抓不到壞掉的 MANIFEST——它現在是恆真的。", file=sys.stderr)
-    return 1
+    if "FAIL" not in caught:
+        print("\n負向測試失敗：檢查器抓不到壞掉的 MANIFEST——它現在是恆真的。", file=sys.stderr)
+        return 1
+    print("\n負向測試通過：檢查器在壞掉的 MANIFEST 上會紅。")
+    ok = field_self_test()
+    ok = org_role_self_test() and ok
+    ok = context_self_test() and ok
+    return 0 if ok else 1
+
+
+def org_role_self_test():
+    """org／role 的每種壞法都要抓到；組織真名要在條目與可升級區兩邊都被擋。"""
+    vocab = {"甲": {"area": [], "stage": [], "role": ["寫者"]}}
+    orgs = {"C1": []}
+    def ent(layer, **fm):
+        return {"layer": layer, "relpath": f"{layer}/x.md", "stem": "x", "fm": fm}
+    must_fail = {
+        "未定義的組織代碼": ent(EXPRESSIONS, field="甲", org="C9"),
+        "role 不在所填 field 的表": ent(EXPRESSIONS, field="甲", role="審者"),
+        "沒有 field 卻填 role": ent(EXPRESSIONS, role="寫者"),
+        "Decisions 填了 org": ent("Decisions", field="甲", org="C1"),
+    }
+    ok = True
+    for name, e in must_fail.items():
+        probs = []
+        org_role_problems(e, vocab, orgs, probs)
+        ok &= bool(probs)
+        print(f"  {'✓' if probs else '✗'} lint 抓得到：{name}")
+    probs = []
+    org_role_problems(ent(EXPRESSIONS, field="甲", org="C1", role="寫者"), vocab, orgs, probs)
+    ok &= not probs
+    print(f"  {'✓' if not probs else '✗'} 合法的 org／role 不誤報")
+    hit = org_name_hits("某次在 AcmeCorp 的事", ["acmecorp"]) == ["acmecorp"]
+    ok &= hit
+    print(f"  {'✓' if hit else '✗'} 組織真名比對不分大小寫")
+    pass_ = passes_field_filter(ent(EXPRESSIONS, field="甲"), "甲", org="C1", role="寫者")
+    block = not passes_field_filter(ent(EXPRESSIONS, field="甲", org="C2"), "甲", org="C1")
+    ok &= pass_ and block
+    print(f"  {'✓' if pass_ and block else '✗'} 過濾：沒標組織的放行、別的組織擋下")
+    return ok
+
+
+def context_self_test():
+    """情境四層：專案明示、遠端推斷、裝置預設、未宣告，各給對的值與來源層。用暫存目錄，不碰本機區。"""
+    import tempfile
+    global ORGS_PATH, PROJECTS_PATH, CONTEXT_PATH
+    saved = (ORGS_PATH, PROJECTS_PATH, CONTEXT_PATH)
+    try:
+        return _context_self_test(tempfile)
+    finally:
+        ORGS_PATH, PROJECTS_PATH, CONTEXT_PATH = saved
+
+
+def _context_self_test(tempfile):
+    global ORGS_PATH, PROJECTS_PATH, CONTEXT_PATH
+    ok = True
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = os.path.realpath(tmp)
+        proj, remote_only, bare = (os.path.join(tmp, n) for n in ("proj", "remote", "bare"))
+        for d in (proj, remote_only, bare):
+            os.makedirs(d)
+        subprocess.run(["git", "init", "-q", remote_only], capture_output=True)
+        subprocess.run(["git", "-C", remote_only, "remote", "add", "origin",
+                        "git@github.com:example-org/svc.git"], capture_output=True)
+        ORGS_PATH, PROJECTS_PATH, CONTEXT_PATH = (os.path.join(tmp, n) for n in
+                                                  ("orgs.tsv", "projects.tsv", "context.toml"))
+        open(ORGS_PATH, "w").write("code\tname\tremotes\nC1\tExample Org\tgithub.com/example-org/*\n")
+        personal = os.path.join(tmp, "personal")
+        os.makedirs(personal)
+        open(PROJECTS_PATH, "w").write(f"path\torg\trole\tfield\tdoc_language\n{proj}\tC2\t開發者\t技術\t純中文\n"
+                                       f"{personal}\t-\t開發者\t技術\t純中文\n")
+        cases = [
+            ("專案明示", os.path.join(proj, "sub"), {"org": ("C2", "專案明示"), "role": ("開發者", "專案明示")}),
+            ("遠端推斷", remote_only, {"org": ("C1", "遠端推斷"), "role": (None, None)}),
+        ]
+        for name, cwd, want in cases:
+            os.makedirs(cwd, exist_ok=True)
+            got = resolve_context(cwd)
+            good = all(got[k] == v for k, v in want.items())
+            ok &= good
+            print(f"  {'✓' if good else '✗'} 情境：{name}")
+        got = resolve_context(bare)
+        good = not any(v for v, _ in got.values())
+        ok &= good
+        print(f"  {'✓' if good else '✗'} 情境：未宣告")
+        open(CONTEXT_PATH, "w").write('[device]\norg = "C3"\nrole = "審查者"\n')
+        got = resolve_context(bare)
+        good = got["org"] == ("C3", "裝置預設") and resolve_context(proj)["org"] == ("C2", "專案明示")
+        ok &= good
+        print(f"  {'✓' if good else '✗'} 情境：裝置預設排在專案明示之後")
+        good = resolve_context(personal)["org"] == (None, "專案明示")
+        ok &= good
+        print(f"  {'✓' if good else '✗'} 情境：專案明示「-」不被裝置預設補上")
+    urls = {"https://GitHub.com/Example-Org/x.git": "github.com/example-org/x",
+            "ssh://git@github.com:22/org/r.git": "github.com/org/r",
+            "https://u:p@host:8443/o/r": "host/o/r",
+            "git@github.com:2024org/r.git": "github.com/2024org/r"}
+    bad = [u for u, want in urls.items() if normalize_remote(u) != want]
+    ok &= not bad
+    print(f"  {'✓' if not bad else '✗'} remote 正規化：大小寫、埠號、數字開頭的 owner" + (f"（錯：{bad}）" if bad else ""))
+    fp = org_name_hits("metadata outline blockquote", ["Meta", "Line", "Block"])
+    ok &= not fp
+    print(f"  {'✓' if not fp else '✗'} 拉丁字母的組織名要整個詞對上")
+    print("\norg／role 與情境負向測試" + ("通過。" if ok else "失敗：上面標 ✗ 的那幾項。"))
+    return ok
+
+
+def field_self_test():
+    """領域軸的負向測試：每一種壞法都要被 lint 抓到，過濾的三種放行都要成立。
+
+    詞彙寫在這裡不讀 axes.toml：測的是檢查器，不是某一座棧的詞彙。
+    """
+    vocab = {"甲": {"area": ["A1", "A2"], "stage": ["S1"]}, "乙": {"area": [], "stage": []},
+             FIELD_UNIVERSAL: {"area": [], "stage": []}}
+    def ent(layer, **fm):
+        fm.setdefault("recorded", "2026-01-01")
+        return {"layer": layer, "relpath": f"{layer}/x.md", "stem": "x", "fm": fm}
+    must_fail = {
+        "值不在表裡": ent("Decisions", field="丙"),
+        "area 不屬於所填 field": ent("Decisions", field="乙", area="A1"),
+        "stage 不在表裡": ent("Decisions", field="甲", stage="S9"),
+        "沒有 field 卻填 area": ent("Decisions", area="A1"),
+        "跨領域的層填了 field": ent("Models", field="甲"),
+        "界線後缺 field": ent("Decisions", recorded="2026-12-01"),
+    }
+    ok = True
+    for name, e in must_fail.items():
+        probs, missing = [], []
+        field_problems(e, vocab, "2026-06-01", probs, missing)
+        hit = bool(probs)
+        ok &= hit
+        print(f"  {'✓' if hit else '✗'} lint 抓得到：{name}")
+    probs, missing = [], []
+    field_problems(ent("Decisions", field="甲、乙", area="A2", stage="S1"), vocab, "2026-06-01", probs, missing)
+    ok &= not probs
+    print(f"  {'✓' if not probs else '✗'} 合法的多值不誤報")
+    must_pass = {
+        "沒有領域軸的層": ent("Frameworks"),
+        "還沒回填的條目": ent("Decisions"),
+        "通用": ent("Decisions", field=FIELD_UNIVERSAL),
+        "同領域、沒填 area": ent("Decisions", field="甲"),
+    }
+    for name, e in must_pass.items():
+        hit = passes_field_filter(e, "甲", "A1")
+        ok &= hit
+        print(f"  {'✓' if hit else '✗'} 過濾放行：{name}")
+    blocked = not passes_field_filter(ent("Decisions", field="乙"), "甲")
+    blocked &= not passes_field_filter(ent("Decisions", field="甲", area="A2"), "甲", "A1")
+    ok &= blocked
+    print(f"  {'✓' if blocked else '✗'} 過濾擋下：別的領域、同領域別的分區")
+    print("\n領域軸負向測試" + ("通過。" if ok else "失敗：上面標 ✗ 的那幾項現在是恆真的。"))
+    return ok
 
 
 # ---------------------------------------------------------------- 接線安裝
@@ -4094,8 +4764,9 @@ def cmd_journal_new(args):
     review_on = args.review_on or (today + datetime.timedelta(days=args.days)).isoformat()
     # 留痕：跑一次 recall，拿最後那行。這行證明判斷有依據，也讓回看時查得到用了哪幾筆
     trace = "（recall 失敗，沒有留痕）"
-    r = subprocess.run([sys.executable, os.path.realpath(__file__), "recall", args.decision,
-                        "-q", "--no-branches", "-k", "3"], capture_output=True, text=True)
+    cmd = [sys.executable, os.path.realpath(__file__), "recall", args.decision,
+           "-q", "--no-branches", "-k", "3"] + (["--field", args.field] if args.field else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
     for line in r.stdout.splitlines():
         if line.startswith("決策棧檢索："):
             trace = line.strip()
@@ -4104,6 +4775,23 @@ def cmd_journal_new(args):
     text = (tpl.replace("<決定>", args.decision).replace("<YYYY-MM-DD>", today.isoformat())
                .replace("<回看日>", review_on).replace("<留痕行>", trace)
                .replace("<公司 | 個人 | 生活>", args.domain))
+    # field 選填。沒給就整行拿掉，留著佔位符會被 stats 讀成一個叫「<…>」的領域
+    if args.field:
+        text = re.sub(r"^field: .*$", lambda _: f"field: {args.field}", text, count=1, flags=re.M)
+        try:
+            if args.field not in (field_vocab() or {args.field: None}):
+                print(f"⚠ `--field {args.field}` 不在 tools/axes.toml，照寫進日誌，統計會多出這一類")
+        except AxesError:
+            pass
+    else:
+        text = re.sub(r"^field: .*\n", "", text, count=1, flags=re.M)
+    # 下決定那一刻戴哪頂帽子。回看統計可以依職務分組，看哪一頂帽子底下猜得最不準
+    ctx = resolve_context(os.getcwd())
+    extra = "".join(f"{k}: {ctx[k][0]}\n" for k in ("org", "role") if ctx[k][0])
+    if extra:
+        text, n = re.subn(r"^(domain: .*\n)", lambda m: m.group(1) + extra, text, count=1, flags=re.M)
+        if not n:
+            print("⚠ 日誌樣板沒有 domain: 那一行，org／role 沒有寫進去")
     sub = os.path.join(root, today.strftime("%Y"), today.strftime("%m"))
     os.makedirs(sub, exist_ok=True)
     path = os.path.join(sub, f"{today.isoformat()}-{journal_slug(args.slug or args.decision)}.md")
@@ -4149,7 +4837,7 @@ def cmd_journal_review(args):
     import datetime
     block = (f"\n## 回看\n\n回看日 {datetime.date.today().isoformat()}\n\n"
              "結果      <實際發生什麼>\n"
-             "對答案    <結果落在預測的哪一邊；「算錯的條件」成立了沒>\n"
+             "對答案    <命中 ｜ 落空>：<結果落在預測的哪一邊；「算錯的條件」成立了沒>\n"
              "落點      <外部 ｜ 認知（策略 ｜ 人員組成 ｜ 執行）>\n"
              "下一步    <更新機率 ｜ 寫入棧：<條目名> ｜ 運氣，判斷留著>\n")
     text = re.sub(r"^status: open$", "status: reviewed", text, count=1, flags=re.M)
@@ -4168,20 +4856,57 @@ def cmd_journal_stats(args):
     to_stack = sum(1 for _, body in reviewed if re.search(r"寫入棧[：:]\s*[A-Za-z]", body))
     # 佔位符裡也有「運氣」兩個字，只數填過的那一行
     luck = sum(1 for _, body in reviewed
-               if re.search(r"^下一步\s+(?!<).*運氣", section_body(body, "回看"), re.M))
+               if re.search(r"^下一步\s+(?![\s<]).*運氣", section_body(body, "回看"), re.M))
     by_dom = {}
     for _, fm, _ in es:
         by_dom[fm.get("domain", "?")] = by_dom.get(fm.get("domain", "?"), 0) + 1
     print(f"日誌 {len(es)} 筆：open {opened}、已回看 {len(reviewed)}"
           f"（寫進棧 {to_stack}、判為運氣 {luck}）")
     print("  依場域：" + "、".join(f"{k} {v}" for k, v in sorted(by_dom.items())))
+    journal_calibration(reviewed)
     return 0
+
+
+def journal_calibration(reviewed):
+    """已回看的日誌裡，「對答案」寫成命中或落空的那幾筆：命中率對照當初寫的信心，分領域。
+
+    Brier 分數是 (信心 − 結果)² 的平均，0 最好、0.25 等於每次都猜五成。只印數字不判及格：
+    筆數少的時候它幾乎都是雜訊，要累積到幾十筆才有訊號。
+    """
+    rows = []
+    for fm, body in reviewed:
+        m = re.search(r"^對答案\s+(命中|落空)", section_body(body, "回看"), re.M)
+        c = re.search(r"信心\s*(\d{1,3})\s*%", section_body(body, "預測"))
+        if m and c:
+            rows.append((fm.get("field") or "（未標）", min(int(c.group(1)), 100) / 100,
+                         1 if m.group(1) == "命中" else 0, fm.get("role") or "（未標）"))
+    unstructured = len(reviewed) - len(rows)
+    if not rows:
+        print(f"  校準：還沒有可算的回看（要「對答案 命中｜落空」加預測裡的「信心 N%」；"
+              f"已回看但沒寫成這個形式的 {unstructured} 筆）")
+        return
+    print(f"  校準（{len(rows)} 筆可算；沒寫成命中／落空或沒寫信心的 {unstructured} 筆不計）：")
+    def line(lab, rs):
+        hit = sum(r[2] for r in rs) / len(rs)
+        conf = sum(r[1] for r in rs) / len(rs)
+        brier = sum((r[1] - r[2]) ** 2 for r in rs) / len(rs)
+        print(f"    {lab:<8} {len(rs):>3} 筆　命中率 {hit:.0%}　平均信心 {conf:.0%}　Brier {brier:.3f}")
+    order = lambda x: (x == "（未標）", x)
+    for lab in sorted({r[0] for r in rows}, key=order):
+        line(lab, [r for r in rows if r[0] == lab])
+    roles = sorted({r[3] for r in rows}, key=order)
+    if roles != ["（未標）"]:
+        print("  依職務：")
+        for lab in roles:
+            line(lab, [r for r in rows if r[3] == lab])
+    line("全部", rows)
 
 
 JOURNAL_FALLBACK = """---
 type: journal
 decision: <決定>
 domain: <公司 | 個人 | 生活>
+field: <選填。tools/axes.toml 的 field 名>
 date: <YYYY-MM-DD>
 review_on: <回看日>
 status: open
@@ -4273,7 +4998,22 @@ def main():
                    help="唯讀：用既有索引比對、不重嵌不寫檔；過期與全新條目明列（計畫模式用）")
     r.add_argument("--expand", action="store_true",
                    help="每筆命中印出機器層（規則、步驟、判準、邊界），agent 不必再開檔")
+    r.add_argument("--field", help="只在這個領域（加通用、未回填、沒有領域軸的層）裡排序")
+    r.add_argument("--area", help="再收窄到這個分區，例：BE")
+    r.add_argument("--stage", help="再收窄到這個階段，例：驗證")
+    r.add_argument("--org", help="Expressions 收窄到這個組織代碼（沒標組織的照樣放行）")
+    r.add_argument("--role", help="Expressions 收窄到這個職務立場（沒標的照樣放行）")
     r.set_defaults(func=cmd_recall)
+    cx = sub.add_parser("context", help="這個目錄戴哪頂帽子：org、role、field、文件語言，各自從哪一層來")
+    cx.add_argument("--audit", action="store_true", help="近期 recall 的情境來源分佈")
+    cx.add_argument("--days", type=int, default=30)
+    cx.set_defaults(func=cmd_context)
+    st = sub.add_parser("stats", help="origin × field 筆數，加每月被糾正（judgment_case）的筆數")
+    st.add_argument("--months", type=int, default=6)
+    st.set_defaults(func=cmd_stats)
+    mx = sub.add_parser("matrix", help="一個領域的 area × stage 筆數，空格顯示 0——看哪一格還沒有人填")
+    mx.add_argument("--field", required=True, help="tools/axes.toml 裡的一個 field")
+    mx.set_defaults(func=cmd_matrix)
 
     s = sub.add_parser("shape", help="全量 cluster：收斂候選與拆分候選")
     s.add_argument("--threshold", type=float, default=0.70, help="同群門檻（預設 0.70）")
@@ -4342,6 +5082,7 @@ def main():
     jn = josub.add_parser("new", help="下決定的當下寫一筆，自動跑 recall 留痕")
     jn.add_argument("decision", help="一句話，做什麼決定")
     jn.add_argument("--domain", choices=["公司", "個人", "生活"], default="公司")
+    jn.add_argument("--field", help="tools/axes.toml 的 field 名。給了會一併過濾留痕用的 recall，回看統計可以分領域")
     jn.add_argument("--days", type=int, default=90, help="幾天後回看（預設 90）")
     jn.add_argument("--review-on", help="指定回看日 YYYY-MM-DD，蓋過 --days")
     jn.add_argument("--slug", help="檔名用的短字串；沒給就從決定那句切")

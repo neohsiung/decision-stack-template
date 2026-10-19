@@ -77,6 +77,8 @@ stack eval                # 對你自己寫的題目跑檢索回歸，跟基線�
 stack usage               # 哪些條目從來沒被任何情境需要
 stack prose <檔案>        # 量任意一段文字的句子形狀，對照棧內條目
 stack tree                # 推導鏈的格狀結構與孤兒
+stack matrix --field 技術  # 一個領域的分區 × 階段，空格是還沒有人寫過的地方
+stack context             # 這個專案戴哪頂帽子：組織、職務、領域、文件語言，各自從哪一層來
 stack migrate             # 分節順序升級時把條目搬成新順序，只搬節不改句子
 stack memory --sync       # 索引行摘要跟著 description 走，不手寫第二份
 stack skeleton <條目>     # 印可以整段複製的骨架，不另開模板目錄

@@ -1,0 +1,4 @@
+path	org	role	field	doc_language
+# 每個專案戴哪頂帽子。stack context 取路徑前綴最長的那一列，這一層排在最前面。
+# path：專案根目錄，可用 ~。org：代碼。個人專案寫「-」，表示明示沒有組織；留空則往下一層找。role、field：tools/axes.toml 的值。
+# doc_language：英文、中文為主英文輔助、純中文三選一，管註解與文件用什麼語言。

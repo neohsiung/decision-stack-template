@@ -1,0 +1,7 @@
+# 裝置的預設帽子。stack context 在專案沒宣告、remote 也對不上時才用它，所以排在最後。
+# 一台機器同時做兩種角色的事時，這裡留空，改在 projects.tsv 逐專案宣告。
+[device]
+# org = "C1"
+# role = "開發者"
+# field = "技術"
+# doc_language = "英文"
