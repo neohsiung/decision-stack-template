@@ -4807,20 +4807,42 @@ def cmd_journal_new(args):
     return 0
 
 
+JOURNAL_QUIET_DAYS = 7
+
+
+def journal_quiet_line(entries, today):
+    """最近 JOURNAL_QUIET_DAYS 天沒有新日誌時回一行提問，否則回 None。
+    寫入是事件觸發，當下漏掉就沒有東西會提醒；到期檢查每天都在跑，順手補抓寫入那一環。"""
+    import datetime
+    dates = sorted(str(fm.get("date", "")) for _, fm, _ in entries if fm.get("date"))
+    since = (today - datetime.timedelta(days=JOURNAL_QUIET_DAYS)).isoformat()
+    if dates and dates[-1] > since:
+        return None
+    last = f"最近一筆是 {dates[-1]}" if dates else "日誌還沒有任何一筆"
+    return (f"過去 {JOURNAL_QUIET_DAYS} 天沒有新日誌（{last}）。這段時間有沒有結果幾個月內會揭曉、"
+            "還沒寫的決定？有的話：stack journal new")
+
+
 def cmd_journal_due(args):
     import datetime
     root = journal_root()
+    entries = journal_entries(root)
+    quiet = journal_quiet_line(entries, datetime.date.today())
     limit = (datetime.date.today() + datetime.timedelta(days=args.days)).isoformat()
-    due = [(p, fm) for p, fm, _ in journal_entries(root)
+    due = [(p, fm) for p, fm, _ in entries
            if fm.get("status", "open") == "open" and str(fm.get("review_on", "9999")) <= limit]
     if not due:
         print("沒有到期要回看的日誌。")
+        if quiet:
+            print(quiet)
         return 0
     print(f"{len(due)} 筆到期（含 {args.days} 天內）：")
     for p, fm in due:
         print(f"  {fm.get('review_on', '?')}  {fm.get('domain', '?')}  {fm.get('decision', '')[:40]}")
         print(f"      {os.path.relpath(p, root)}")
     print("\n回看：stack journal review <檔>。先讀日誌，再看結果。")
+    if quiet:
+        print(quiet)
     return 0
 
 
