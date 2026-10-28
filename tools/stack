@@ -1533,7 +1533,7 @@ def cmd_trace(args):
     的檢索紀錄。
 
     **不給及格與不及格。** 「差幾天算太舊」是判斷，訂一個沒有根據的天數會讓判斷者
-    系統性高估（Models/a-criterion-must-terminate.md）。這裡印可數的事實，判斷留給
+    系統性高估，判準要寫成判得完的形狀。這裡印可數的事實，判斷留給
     讀的人。唯一決定性的結論是留痕行不存在，而那一條使用契約已經寫死：沒有這一行
     等於沒檢索。
     """
@@ -3498,7 +3498,7 @@ def read_manifest(path=MANIFEST_PATH):
 
 
 def registered_hook_commands(settings_path):
-    """settings.json 裡所有 hook 的 command 字串。**只讀不寫**——那個檔含明文金鑰。"""
+    """settings.json 裡所有 hook 與 statusLine 的 command 字串。**只讀不寫**——那個檔含明文金鑰。"""
     try:
         with open(settings_path, encoding="utf-8") as f:
             data = json.load(f)
@@ -3517,6 +3517,7 @@ def registered_hook_commands(settings_path):
                 walk(v)
 
     walk(data.get("hooks", {}))
+    walk(data.get("statusLine", {}))   # statusLine 也是執行指令的接線點，漏掉會把它報成死接線
     return cmds
 
 
